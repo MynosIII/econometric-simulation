@@ -1,0 +1,181 @@
+                    linestyle="-" if relation == "credit" else "--",
+                    linewidth=0.28 + 0.035 * math.sqrt(max(value, 0.0)),
+                    alpha=0.17,
+                )
+
+        ax.set_xlim(0, cols - 1)
+        ax.set_ylim(0, rows - 1)
+        ax.set_zlim(0, max(16.0, float(z.max() + 5.0)))
+        ax.set_xlabel("Economic space X")
+        ax.set_ylabel("Economic space Y")
+        ax.set_zlabel("Available opportunity")
+        ax.view_init(elev=37, azim=-55)
+        ax.set_title(
+            f"Turn {self.sim.turn} | firms {sum(f.alive for f in self.sim.firms)} | "
+            f"households {sum(h.alive for h in self.sim.households)} | "
+            f"banks {sum(b.alive for b in self.sim.banks)}"
+        )
+        ax.legend(loc="upper left", fontsize=7, framealpha=0.80, ncol=2)
+
+    def _draw_real_economy(self) -> None:
+        ax = self.ax_real
+        ax.clear()
+        turns = np.arange(1, len(self.sim.history["output"]) + 1)
+        if turns.size:
+            ax.plot(turns, normalized_index(self.sim.history["output"]), label="Output")
+            ax.plot(turns, normalized_index(self.sim.history["consumption"]), label="Consumption")
+            ax.plot(turns, normalized_index(self.sim.history["wages"]), label="Wages")
+            ax.plot(turns, normalized_index(self.sim.history["equity_index"]), label="Equity value")
+        ax.axvline(
+            self.sim.config.structural_break_turn + 1,
+            linestyle="--",
+            color="black",
+            alpha=0.48,
+            linewidth=1,
+            label="Structural break",
+        )
+        ax.set_title("Real economy and financial valuation (first non-zero = 100)")
+        ax.set_xlabel("Turn")
+        ax.set_ylabel("Index")
+        ax.grid(alpha=0.20)
+        ax.legend(fontsize=7, ncol=3)
+
+    def _draw_credit(self) -> None:
+        ax = self.ax_credit
+        ax.clear()
+        turns = np.arange(1, len(self.sim.history["credit"]) + 1)
+        if turns.size:
+            ax.plot(turns, self.sim.history["credit"], label="Outstanding credit")
+            ax.plot(turns, np.asarray(self.sim.history["npl_ratio"]) * 100, label="NPL ratio (%)")
+            withdrawals = np.asarray(self.sim.history["bank_run_withdrawals"])
+            ax.plot(turns, withdrawals, linestyle="--", label="Deposit withdrawals")
+            losses = np.asarray(self.sim.history["credit_losses"])
+            ax.bar(turns, losses, alpha=0.28, label="Credit losses")
+        apr = self.sim.history["mean_new_apr"][-1] if self.sim.history["mean_new_apr"] else np.nan
+        apr_text = "n/a" if np.isnan(apr) else f"{apr:.1%}"
+        reference = self.sim.credit_market.reference_rate_annual
+        ax.set_title(f"Private credit | APR {apr_text}, benchmark {reference:.1%}")
+        ax.set_xlabel("Turn")
+        ax.grid(alpha=0.20)
+        ax.legend(fontsize=7)
+
+    def _draw_lorenz(self) -> None:
+        ax = self.ax_lorenz
+        ax.clear()
+        wealth = np.maximum(
+            np.asarray(
+                [
+                    h.net_worth(self.sim.credit_market, self.sim.equity_market)
+                    for h in self.sim.households
+                    if h.alive
+                ],
+                dtype=float,
+            ),
+            0.0,
+        )
+        ax.plot([0, 1], [0, 1], linestyle="--", color="black", linewidth=1)
+        if wealth.size and wealth.sum() > 0:
+            ordered = np.sort(wealth)
+            cumulative = np.insert(np.cumsum(ordered) / ordered.sum(), 0, 0.0)
+            population = np.linspace(0, 1, cumulative.size)
+            ax.plot(population, cumulative, linewidth=2)
+        latest_gini = self.sim.history["household_gini"][-1] if self.sim.history["household_gini"] else 0
+        top10 = self.sim.history["top10_household_share"][-1] if self.sim.history["top10_household_share"] else 0
+        ax.set_title(f"Household wealth | Gini {latest_gini:.2f}, top 10% {top10:.0%}")
+        ax.set_xlabel("Cumulative households")
+        ax.set_ylabel("Cumulative wealth")
+        ax.set_xlim(0, 1)
+        ax.set_ylim(0, 1)
+        ax.grid(alpha=0.20)
+
+    def _draw_labor_energy(self) -> None:
+        ax = self.ax_labor
+        ax.clear()
+        turns = np.arange(1, len(self.sim.history["employment_rate"]) + 1)
+        if turns.size:
+            ax.plot(turns, np.asarray(self.sim.history["employment_rate"]) * 100, label="Employment (%)")
+            ax.plot(turns, np.asarray(self.sim.history["average_energy"]) * 100, label="Average energy (0-100)")
+            deaths = self.sim.config.households - np.asarray(self.sim.history["alive_households"])
+            ax.plot(turns, deaths, label="Population gap")
+        ax.set_title("Work, consumption and energetic reproduction")
+        ax.set_xlabel("Turn")
+        ax.grid(alpha=0.20)
+        ax.legend(fontsize=7)
+
+    def _draw_capital_strategies(self) -> None:
+        ax = self.ax_capital
+        ax.clear()
+        values = []
+        names = []
+        colors = []
+        for strategy in FUND_STRATEGIES:
+            wealth = sum(
+                max(f.net_worth(self.sim.credit_market, self.sim.equity_market), 0.0)
+                for f in self.sim.funds
+                if f.alive and f.strategy == strategy
+            )
+            names.append(strategy.replace(" ", "\n"))
+            values.append(wealth)
+            colors.append(FUND_COLORS[strategy])
+        ax.bar(names, values, color=colors, alpha=0.82)
+        recap = self.sim.history["recap_dividends"][-1] if self.sim.history["recap_dividends"] else 0.0
+        reorganizations = self.sim.history["reorganizations"][-1] if self.sim.history["reorganizations"] else 0.0
+        ax.set_title(f"Fund wealth | recap payout {recap:.1f}, reorganizations {reorganizations:.0f}")
+        ax.set_ylabel("Net worth")
+        ax.tick_params(axis="x", labelsize=7)
+        ax.grid(axis="y", alpha=0.20)
+
+    def animate(self, interval_ms: int) -> FuncAnimation:
+        def update(_frame: int):
+            self.sim.step()
+            self.draw()
+            return []
+
+        return FuncAnimation(
+            self.fig,
+            update,
+            frames=self.sim.config.turns,
+            interval=interval_ms,
+            repeat=False,
+            blit=False,
+        )
+
+
+# ============================================================
+# CLI
+# ============================================================
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Economic Mesh V2: private-baseline labor, consumption, credit, bankruptcy and equity ABM."
+    )
+    parser.add_argument("--turns", type=int, default=180)
+    parser.add_argument("--firms", type=int, default=55)
+    parser.add_argument("--households", type=int, default=180)
+    parser.add_argument("--banks", type=int, default=4)
+    parser.add_argument("--funds", type=int, default=10)
+    parser.add_argument("--grid", type=int, default=42)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--interval", type=int, default=170)
+    parser.add_argument(
+        "--market-rate",
+        type=float,
+        default=0.045,
+        help="Initial private credit benchmark; it becomes endogenous after the first turn.",
+    )
+    parser.add_argument(
+        "--time-preference",
+        type=float,
+        default=0.018,
+        help="Private annual return required by savers before risk and scarcity premia.",
+    )
+    parser.add_argument(
+        "--shock-severity",
+        type=float,
+        default=0.43,
+        help="Regional productive-capacity loss at the structural break (0 to 0.95).",
+    )
+    parser.add_argument("--no-animation", action="store_true")
+    parser.add_argument("--snapshot", type=str, default="")
+    parser.add_argument("--save-gif", type=str, default="")
