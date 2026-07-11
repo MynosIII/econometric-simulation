@@ -1,0 +1,229 @@
+        y_variance = np.linspace(0.78, 1.25, size)[:, None]
+        local_cluster = gaussian_filter(rng.uniform(0.75, 1.25, size=(size, size)), sigma=6)
+        local_cluster /= np.mean(local_cluster)
+
+        self.capacity = (2.8 + 10.5 * raw) * y_variance * local_cluster
+        self.resources = self.capacity.copy()
+        self.regeneration_rate = config.resource_regeneration
+        self.structural_break_severity = float(np.clip(config.structural_break_severity, 0.0, 0.95))
+        self.break_applied = False
+
+    def opportunity(self, row: int, col: int) -> float:
+        return float(self.resources[row, col])
+
+    def extract(self, row: int, col: int, requested: float) -> float:
+        available = self.resources[row, col]
+        amount = min(max(requested, 0.0), available)
+        self.resources[row, col] -= amount
+        return float(amount)
+
+    def regenerate(self) -> None:
+        carrying = np.maximum(self.capacity, 0.1)
+        self.resources += (
+            self.regeneration_rate
+            * self.resources
+            * (1.0 - self.resources / carrying)
+        )
+        self.resources = np.clip(self.resources, 0.02, carrying)
+
+    def structural_break(self) -> None:
+        if self.break_applied:
+            return
+        rows, cols = self.capacity.shape
+        yy, xx = np.mgrid[0:rows, 0:cols]
+        center_r, center_c = rows * 0.63, cols * 0.38
+        radius_sq = (yy - center_r) ** 2 + (xx - center_c) ** 2
+        regional_shock = 1.0 - self.structural_break_severity * np.exp(
+            -radius_sq / (2.0 * (rows * 0.19) ** 2)
+        )
+        self.capacity *= regional_shock
+        self.resources = np.minimum(self.resources * regional_shock, self.capacity)
+        self.regeneration_rate *= 0.74
+        self.break_applied = True
+
+
+# ============================================================
+# AGENTS AND BALANCE SHEETS
+# ============================================================
+
+
+@dataclass
+class EquityPosition:
+    shares: float
+    cost_basis: float
+    entry_turn: int
+
+
+class BaseAgent:
+    def __init__(self, agent_id: str, cash: float):
+        self.id = agent_id
+        self.cash = float(cash)
+        self.alive = True
+        self.status = "healthy"
+        self.credit_score = 0.72
+        self.loans_borrowed: List[int] = []
+        self.loans_lent: List[int] = []
+        self.equity_positions: Dict[str, EquityPosition] = {}
+        self.bankruptcy_count = 0
+        self.failure_turn: Optional[int] = None
+
+    def debt_outstanding(self, credit_market: "CreditMarket") -> float:
+        return float(
+            sum(
+                credit_market.loans[loan_id].outstanding
+                for loan_id in self.loans_borrowed
+                if loan_id in credit_market.loans
+                and credit_market.loans[loan_id].status
+                in {"active", "delinquent", "restructured"}
+            )
+        )
+
+    def loan_assets(self, credit_market: "CreditMarket") -> float:
+        return float(
+            sum(
+                credit_market.loans[loan_id].outstanding
+                for loan_id in self.loans_lent
+                if loan_id in credit_market.loans
+                and credit_market.loans[loan_id].status
+                in {"active", "delinquent", "restructured"}
+            )
+        )
+
+    def equity_value(self, equity_market: "EquityMarket") -> float:
+        value = 0.0
+        for firm_id, position in self.equity_positions.items():
+            value += position.shares * equity_market.price_of(firm_id)
+        return float(value)
+
+    def net_worth(
+        self,
+        credit_market: "CreditMarket",
+        equity_market: "EquityMarket",
+    ) -> float:
+        return (
+            self.cash
+            + self.loan_assets(credit_market)
+            + self.equity_value(equity_market)
+            - self.debt_outstanding(credit_market)
+        )
+
+    def liquid_assets(self, equity_market: "EquityMarket") -> float:
+        return self.cash + self.equity_value(equity_market)
+
+    def credit_features(
+        self,
+        credit_market: "CreditMarket",
+        equity_market: "EquityMarket",
+    ) -> Dict[str, float]:
+        equity = max(self.net_worth(credit_market, equity_market), 0.5)
+        debt = self.debt_outstanding(credit_market)
+        return {
+            "leverage": debt / equity,
+            "profitability": 0.0,
+            "liquidity": self.cash / max(debt + 1.0, 1.0),
+            "stability": self.credit_score,
+        }
+
+    def raise_liquidity(self, amount: float, equity_market: "EquityMarket") -> float:
+        needed = max(0.0, amount - self.cash)
+        if needed <= 0:
+            return 0.0
+        return equity_market.liquidate_portfolio(self, needed)
+
+
+@dataclass
+class FirmTraits:
+    exploration: float
+    credit_appetite: float
+    target_leverage: float
+    investment_rate: float
+    markup: float
+    labor_intensity: float
+    dividend_rate: float
+
+    def mutate(self, rng: np.random.Generator, scale: float = 0.075) -> "FirmTraits":
+        values = np.array(
+            [
+                self.exploration,
+                self.credit_appetite,
+                self.target_leverage,
+                self.investment_rate,
+                self.markup,
+                self.labor_intensity,
+                self.dividend_rate,
+            ],
+            dtype=float,
+        )
+        values += rng.normal(0.0, scale, size=values.size)
+        lower = np.array([0.02, 0.05, 0.05, 0.08, 0.03, 0.15, 0.0])
+        upper = np.array([1.5, 1.5, 2.5, 0.95, 0.70, 1.25, 0.45])
+        values = np.clip(values, lower, upper)
+        return FirmTraits(*values.tolist())
+
+
+FIRM_STRATEGY_CENTERS: Dict[str, np.ndarray] = {
+    "Conservative": np.array([0.18, 0.22, 0.30, 0.30, 0.18, 0.55, 0.12]),
+    "Balanced": np.array([0.42, 0.52, 0.68, 0.52, 0.25, 0.67, 0.16]),
+    "Growth": np.array([0.66, 0.90, 1.20, 0.76, 0.31, 0.74, 0.08]),
+    "Extractive": np.array([0.88, 1.25, 1.85, 0.42, 0.48, 0.46, 0.34]),
+}
+
+FIRM_STRATEGY_COLORS = {
+    "Conservative": "tab:blue",
+    "Balanced": "tab:green",
+    "Growth": "tab:orange",
+    "Extractive": "tab:red",
+}
+
+
+def classify_firm_strategy(traits: FirmTraits) -> str:
+    vector = np.array(
+        [
+            traits.exploration,
+            traits.credit_appetite,
+            traits.target_leverage,
+            traits.investment_rate,
+            traits.markup,
+            traits.labor_intensity,
+            traits.dividend_rate,
+        ]
+    )
+    return min(
+        FIRM_STRATEGY_CENTERS,
+        key=lambda name: float(np.linalg.norm(vector - FIRM_STRATEGY_CENTERS[name])),
+    )
+
+
+def random_firm_traits(rng: np.random.Generator) -> FirmTraits:
+    name = str(rng.choice(list(FIRM_STRATEGY_CENTERS)))
+    values = FIRM_STRATEGY_CENTERS[name] + rng.normal(0.0, 0.07, size=7)
+    values = np.clip(
+        values,
+        [0.02, 0.05, 0.05, 0.08, 0.03, 0.15, 0.0],
+        [1.5, 1.5, 2.5, 0.95, 0.70, 1.25, 0.45],
+    )
+    return FirmTraits(*values.tolist())
+
+
+class Firm(BaseAgent):
+    def __init__(
+        self,
+        agent_id: str,
+        position: Tuple[int, int],
+        traits: FirmTraits,
+        rng: np.random.Generator,
+        cash: float = 12.0,
+        productive_capital: float = 7.0,
+        generation: int = 0,
+    ):
+        super().__init__(agent_id, cash)
+        self.position = np.array(position, dtype=int)
+        self.traits = traits
+        self.productive_capital = float(productive_capital)
+        self.productivity = float(rng.lognormal(mean=0.0, sigma=0.14))
+        self.inventory = float(rng.uniform(0.0, 2.0))
+        self.goods_price = float(rng.uniform(1.0, 1.35))
+        self.sales_last_turn = 0.0
+        self.units_sold_last_turn = 0.0
+        self.output_last_turn = 0.0
+        self.wage_bill_last_turn = 0.0
