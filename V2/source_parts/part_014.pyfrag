@@ -1,0 +1,172 @@
+        for household in self.households:
+            if not household.alive:
+                continue
+            household.energy = float(np.clip(household.energy, 0.0, 1.25))
+            if household.energy <= self.config.minimum_energy:
+                household.alive = False
+                household.status = "energy_failure"
+                household.failure_turn = self.turn
+
+    def _firm_entry(self) -> None:
+        """Privately financed spin-offs; no automatic replacement of failed firms."""
+        if self.turn == 0 or self.turn % self.config.private_spin_off_interval != 0:
+            return
+        if sum(firm.alive for firm in self.firms) >= self.config.firms:
+            return
+        parents = [
+            firm
+            for firm in self.firms
+            if firm.alive
+            and firm.rolling_profit() > 0.35
+            and firm.cash > self.config.private_spin_off_cash + 4.0
+            and firm.productive_capital > self.config.private_spin_off_capital + 3.0
+        ]
+        parents.sort(
+            key=lambda firm: (
+                firm.rolling_profit()
+                + 0.025 * firm.net_worth(self.credit_market, self.equity_market)
+            ),
+            reverse=True,
+        )
+        missing = self.config.firms - sum(firm.alive for firm in self.firms)
+        for parent in parents[:missing]:
+            seed_cash = self.config.private_spin_off_cash
+            seed_capital = self.config.private_spin_off_capital
+            parent.cash -= seed_cash
+            parent.productive_capital -= seed_capital
+            row = int(np.clip(parent.position[0] + self.rng.integers(-3, 4), 0, self.config.grid_size - 1))
+            col = int(np.clip(parent.position[1] + self.rng.integers(-3, 4), 0, self.config.grid_size - 1))
+            firm = Firm(
+                agent_id=f"E{self.next_firm_id}",
+                position=(row, col),
+                traits=parent.traits.mutate(self.rng),
+                rng=self.rng,
+                cash=seed_cash,
+                productive_capital=seed_capital,
+                generation=parent.generation + 1,
+            )
+            self.next_firm_id += 1
+            self.firms.append(firm)
+            self.equity_market.register_firm(firm)
+
+    def _build_network(self) -> Tuple[float, float]:
+        graph = nx.MultiDiGraph()
+        for agent in self.agents:
+            if agent.alive:
+                graph.add_node(agent.id, kind=agent.__class__.__name__)
+        for loan in self.credit_market.active_loans:
+            if loan.lender_id in graph and loan.borrower_id in graph:
+                graph.add_edge(
+                    loan.lender_id,
+                    loan.borrower_id,
+                    weight=loan.outstanding,
+                    relation="credit",
+                )
+        for investor in self.agents:
+            if not investor.alive:
+                continue
+            for firm_id, position in investor.equity_positions.items():
+                if firm_id in graph and position.shares > 0:
+                    graph.add_edge(
+                        investor.id,
+                        firm_id,
+                        weight=position.shares * self.equity_market.price_of(firm_id),
+                        relation="equity",
+                    )
+        self.network = graph
+        if graph.number_of_nodes() <= 1 or graph.number_of_edges() == 0:
+            return 0.0, 0.0
+        simple = nx.DiGraph()
+        for u, v, data in graph.edges(data=True):
+            simple.add_edge(u, v, weight=simple.get_edge_data(u, v, {}).get("weight", 0.0) + data.get("weight", 1.0))
+        try:
+            rank = nx.pagerank(simple, weight="weight", max_iter=100)
+            concentration = max(rank.values()) if rank else 0.0
+        except Exception:
+            concentration = 0.0
+        density = nx.density(simple)
+        return float(concentration), float(density)
+
+    def _record_metrics(
+        self,
+        output: float,
+        consumption: float,
+        wages: float,
+        employment_rate: float,
+        forecast_output: float,
+    ) -> None:
+        household_wealth = [
+            h.net_worth(self.credit_market, self.equity_market)
+            for h in self.households
+            if h.alive
+        ]
+        firm_wealth = [
+            f.net_worth(self.credit_market, self.equity_market)
+            for f in self.firms
+            if f.alive
+        ]
+        energy = [h.energy for h in self.households if h.alive]
+        prices = [f.goods_price for f in self.firms if f.alive]
+        price_level = float(np.mean(prices)) if prices else 0.0
+        equity_values = [
+            self.equity_market.price_of(f.id) * f.shares_outstanding
+            for f in self.firms
+            if f.alive
+        ]
+        equity_index = float(sum(equity_values))
+        concentration, density = self._build_network()
+        forecast_error = abs(output - forecast_output) / max(abs(output), 1.0)
+
+        values = {
+            "output": output,
+            "consumption": consumption,
+            "wages": wages,
+            "employment_rate": employment_rate,
+            "average_energy": float(np.mean(energy)) if energy else 0.0,
+            "household_gini": gini(household_wealth),
+            "firm_gini": gini(firm_wealth),
+            "top10_household_share": top_share(household_wealth),
+            "credit": self.credit_market.outstanding_credit(),
+            "npl_ratio": self.credit_market.nonperforming_ratio(),
+            "mean_new_apr": float(np.mean(self.credit_market.new_loan_rates)) if self.credit_market.new_loan_rates else np.nan,
+            "interest_paid": self.credit_market.interest_paid_last_turn,
+            "credit_losses": self.credit_market.credit_losses_last_turn,
+            "reorganizations": float(self.insolvency.reorganizations_last_turn),
+            "liquidations": float(self.insolvency.liquidations_last_turn),
+            "household_defaults": float(self.insolvency.household_defaults_last_turn),
+            "bank_failures": float(self.bank_failures_last_turn),
+            "bank_run_withdrawals": self.bank_run_withdrawals_last_turn,
+            "unmet_bank_withdrawals": self.unmet_bank_withdrawals_last_turn,
+            "deposit_losses": self.deposit_losses_last_turn,
+            "market_reference_rate": self.credit_market.reference_rate_annual,
+            "equity_index": equity_index,
+            "primary_equity": self.equity_market.total_primary_investment_last_turn,
+            "regular_dividends": self.equity_market.dividends_paid_last_turn,
+            "recap_dividends": self.equity_market.recap_dividends_last_turn,
+            "network_concentration": concentration,
+            "network_density": density,
+            "alive_firms": float(sum(f.alive for f in self.firms)),
+            "alive_households": float(sum(h.alive for h in self.households)),
+            "price_level": price_level,
+            "inflation_annual": self.inflation_annual,
+            "forecast_output": forecast_output,
+            "forecast_error": forecast_error,
+        }
+        for key, value in values.items():
+            self.history[key].append(float(value))
+
+        for name in FIRM_STRATEGY_CENTERS:
+            self.firm_strategy_history[name].append(
+                sum(1 for firm in self.firms if firm.alive and firm.strategy == name)
+            )
+        for strategy in FUND_STRATEGIES:
+            wealth = sum(
+                max(fund.net_worth(self.credit_market, self.equity_market), 0.0)
+                for fund in self.funds
+                if fund.alive and fund.strategy == strategy
+            )
+            self.fund_strategy_wealth_history[strategy].append(float(wealth))
+
+    def step(self) -> None:
+        if self.turn >= self.config.turns:
+            return
