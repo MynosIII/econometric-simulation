@@ -1,0 +1,161 @@
+        return max(0.0, 0.72 * window[-1] + 0.28 * (window[-1] + trend))
+
+    def _update_inflation(self) -> None:
+        prices = [firm.goods_price for firm in self.firms if firm.alive]
+        current_level = float(np.mean(prices)) if prices else 1.0
+        previous_level = self.history["price_level"][-1] if self.history["price_level"] else current_level
+        monthly = current_level / max(previous_level, 1e-9) - 1.0
+        annualized = (1.0 + np.clip(monthly, -0.08, 0.12)) ** 12 - 1.0
+        self.inflation_annual = float(
+            np.clip(0.88 * self.inflation_annual + 0.12 * annualized, -0.08, 0.55)
+        )
+
+    def _begin_turn(self) -> None:
+        self.credit_market.reset_turn_flows()
+        self.equity_market.reset_turn_flows()
+        self.insolvency.reset()
+        self.last_resolution_events = []
+        self.bank_failures_last_turn = 0
+        self.bank_run_withdrawals_last_turn = 0.0
+        self.unmet_bank_withdrawals_last_turn = 0.0
+        self.deposit_losses_last_turn = 0.0
+        for bank in self.banks:
+            bank.run_withdrawals_last_turn = 0.0
+            bank.unmet_withdrawals_last_turn = 0.0
+        for firm in self.firms:
+            firm.units_sold_last_turn = 0.0
+            firm.sales_last_turn = 0.0
+            firm.employees.clear()
+        for household in self.households:
+            household.begin_turn(self.config)
+
+    def _move_and_plan_firms(self) -> None:
+        occupancy = self._occupancy()
+        living_households = sum(h.alive for h in self.households)
+        preliminary_vacancies = sum(max(f.job_slots, 1) for f in self.firms if f.alive)
+        scarcity = preliminary_vacancies / max(living_households, 1)
+        for firm in [f for f in self.firms if f.alive]:
+            firm.choose_location(
+                self.landscape,
+                occupancy,
+                self.rng,
+                self.config.movement_cost,
+            )
+            firm.plan_labor(scarcity, self.config)
+
+    def _production_and_consumption(self) -> Tuple[float, float, float, float]:
+        matches, wages, employment_rate = self.labor_market.match(
+            self.households, self.firms, self.config, self.rng
+        )
+        output = 0.0
+        employed_ids: set[str] = set()
+        for firm in [f for f in self.firms if f.alive]:
+            workers = matches.get(firm.id, [])
+            firm.employees = [worker.id for worker in workers]
+            employed_ids.update(firm.employees)
+            labor = sum(worker.effective_labor() for worker in workers)
+            wage_bill = sum(worker.wage_income_last_turn for worker in workers)
+            # Wages were transferred from firm to worker in labor matching.
+            output += firm.produce(labor, 0.0, self.landscape)
+            firm.wage_bill_last_turn = wage_bill
+
+        for household in [h for h in self.households if h.alive and h.id not in employed_ids]:
+            household.subsistence_activity(
+                self.landscape, self.rng, self.config
+            )
+
+        for firm in [f for f in self.firms if f.alive]:
+            firm.update_price(self.inflation_annual, self.rng)
+
+        consumption, units, firm_revenue = self.consumption_market.clear(
+            self.households, self.firms, self.config, self.rng
+        )
+        for firm in [f for f in self.firms if f.alive]:
+            revenue = firm_revenue.get(firm.id, 0.0)
+            firm.cash += revenue
+            firm.close_accounts(revenue)
+            firm.invest_retained_earnings()
+
+        return float(output), float(consumption), float(wages), float(employment_rate)
+
+    def _household_credit_demand(self) -> None:
+        for household in [h for h in self.households if h.alive]:
+            existing = household.debt_outstanding(self.credit_market)
+            if (
+                household.energy < 0.30
+                and household.cash < 0.55
+                and household.employer_id is not None
+                and existing < 5.0
+            ):
+                amount = 1.8 + 1.8 * (0.30 - household.energy)
+                self.credit_market.register_application(
+                    CreditApplication(
+                        borrower_id=household.id,
+                        amount=amount,
+                        maximum_annual_rate=0.48,
+                        term_periods=7,
+                        amortization="annuity",
+                        purpose="consumer hardship",
+                        seniority="junior",
+                        collateral_type="future wage",
+                        collateral_value=0.5 * household.wage_income_last_turn,
+                        covenant_max_leverage=3.0,
+                    )
+                )
+
+    def _firm_credit_demand(self) -> None:
+        for firm in [f for f in self.firms if f.alive]:
+            if firm.age < 3 or firm.status in {"delinquent", "reorganized"}:
+                continue
+            equity = max(firm.net_worth(self.credit_market, self.equity_market), 0.7)
+            existing_debt = firm.debt_outstanding(self.credit_market)
+            leverage = existing_debt / equity
+            target_gap = firm.traits.target_leverage - leverage
+            rolling_profit = firm.rolling_profit()
+            debt_capacity = max(2.0, 7.0 * max(rolling_profit, 0.0) + 0.42 * firm.productive_capital)
+            remaining_capacity = max(0.0, debt_capacity - existing_debt)
+            if remaining_capacity < 1.0 or target_gap <= -0.10:
+                continue
+            working_capital_need = max(0.0, 1.10 * firm.wage_bill_last_turn + 1.2 - firm.cash)
+            growth_need = 0.0
+            if rolling_profit > 0.05:
+                growth_need = max(0.0, 0.18 * firm.productive_capital * firm.traits.credit_appetite)
+            amount = min(11.0, remaining_capacity, working_capital_need + growth_need + 1.4 * max(target_gap, 0.0))
+            if amount < 1.0:
+                continue
+            purpose = "working capital" if working_capital_need >= growth_need else "productive investment"
+            max_rate = 0.095 + 0.10 * min(firm.traits.credit_appetite, 1.0)
+            self.credit_market.register_application(
+                CreditApplication(
+                    borrower_id=firm.id,
+                    amount=amount,
+                    maximum_annual_rate=max_rate,
+                    term_periods=24 if purpose == "productive investment" else 12,
+                    amortization="annuity",
+                    purpose=purpose,
+                    seniority="secured" if purpose == "productive investment" else "senior",
+                    collateral_type="productive capital",
+                    collateral_value=0.55 * firm.productive_capital,
+                    covenant_max_leverage=max(1.0, firm.traits.target_leverage * 1.35),
+                    grace_periods=2 if purpose == "productive investment" else 0,
+                )
+            )
+
+    def _bank_credit_supply(self) -> None:
+        for bank in [b for b in self.banks if b.alive and not b.failed]:
+            bank.update_provisions(self.credit_market)
+            bank.pay_deposit_interest(
+                self.credit_market.reference_rate_annual,
+                self.config,
+            )
+            withdrawals, unmet = bank.process_private_run(
+                self.credit_market,
+                self.equity_market,
+                self.credit_market.reference_rate_annual,
+            )
+            self.bank_run_withdrawals_last_turn += withdrawals
+            self.unmet_bank_withdrawals_last_turn += unmet
+
+            capital_ratio = bank.capital_ratio(self.credit_market, self.equity_market)
+            liquidity_reserve = (
+                bank.liquidity_preference * bank.deposits
