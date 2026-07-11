@@ -1,0 +1,191 @@
+        position: Tuple[int, int],
+        rng: np.random.Generator,
+    ):
+        super().__init__(agent_id, cash=float(rng.uniform(2.0, 8.0)))
+        self.position = np.array(position, dtype=int)
+        self.energy = float(rng.uniform(0.62, 1.0))
+        self.skill = float(rng.lognormal(mean=-0.05, sigma=0.28))
+        self.consumption_propensity = float(rng.uniform(0.50, 0.88))
+        self.reservation_wage = float(rng.uniform(0.72, 1.25))
+        self.risk_aversion = float(rng.uniform(0.25, 0.90))
+        self.employer_id: Optional[str] = None
+        self.wage_income_last_turn = 0.0
+        self.consumption_last_turn = 0.0
+        self.goods_consumed_last_turn = 0.0
+        self.unemployed_turns = 0
+        self.hardship_restructures = 0
+        self.age = int(rng.integers(18, 58))
+
+    def net_worth(
+        self,
+        credit_market: "CreditMarket",
+        equity_market: "EquityMarket",
+    ) -> float:
+        return super().net_worth(credit_market, equity_market)
+
+    def effective_labor(self) -> float:
+        health_factor = np.clip((self.energy - 0.10) / 0.75, 0.05, 1.15)
+        return float(self.skill * health_factor)
+
+    def begin_turn(self, config: SimulationConfig) -> None:
+        if not self.alive:
+            return
+        self.energy -= config.household_metabolism
+        self.wage_income_last_turn = 0.0
+        self.consumption_last_turn = 0.0
+        self.goods_consumed_last_turn = 0.0
+        self.employer_id = None
+
+    def work(self, firm: Firm, wage: float, config: SimulationConfig) -> float:
+        if not self.alive:
+            return 0.0
+        labor = self.effective_labor()
+        effort = config.work_energy_cost * (0.75 + 0.25 * min(labor, 2.0))
+        self.energy -= effort
+        self.cash += wage
+        self.wage_income_last_turn += wage
+        self.employer_id = firm.id
+        self.position = firm.position.copy()
+        self.unemployed_turns = 0
+        return labor
+
+    def subsistence_activity(
+        self,
+        landscape: EconomicLandscape,
+        rng: np.random.Generator,
+        config: SimulationConfig,
+    ) -> float:
+        if not self.alive:
+            return 0.0
+        row, col = self.position
+        extraction = landscape.extract(int(row), int(col), 0.04 + 0.04 * self.skill)
+        cash_income = extraction * rng.uniform(0.55, 0.95)
+        self.cash += cash_income
+        self.energy -= config.subsistence_energy_cost
+        self.energy += 0.18 * extraction
+        self.unemployed_turns += 1
+        return float(cash_income)
+
+    def credit_features(
+        self,
+        credit_market: "CreditMarket",
+        equity_market: "EquityMarket",
+    ) -> Dict[str, float]:
+        equity = max(self.net_worth(credit_market, equity_market), 0.4)
+        debt = self.debt_outstanding(credit_market)
+        income = self.wage_income_last_turn + 0.25
+        return {
+            "leverage": debt / equity,
+            "profitability": income / max(debt + 1.0, 1.0),
+            "liquidity": self.cash / max(income, 0.25),
+            "stability": self.credit_score + 0.12 * (self.employer_id is not None),
+        }
+
+
+class Bank(BaseAgent):
+    """A privately managed bank with endogenous liquidity and solvency choices."""
+
+    def __init__(self, agent_id: str, rng: np.random.Generator, map_position: Tuple[float, float]):
+        opening_deposits = float(rng.uniform(125.0, 175.0))
+        super().__init__(agent_id, cash=opening_deposits + float(rng.uniform(12.0, 30.0)))
+        self.deposits = opening_deposits
+        self.risk_appetite = float(rng.uniform(0.30, 0.82))
+        self.liquidity_preference = float(rng.uniform(0.10, 0.28))
+        self.target_capital_ratio = float(rng.uniform(0.08, 0.19))
+        self.minimum_operating_capital_ratio = float(rng.uniform(0.015, 0.065))
+        self.deposit_confidence = float(rng.uniform(0.82, 0.98))
+        self.deposit_rate_annual = 0.0
+        self.run_withdrawals_last_turn = 0.0
+        self.unmet_withdrawals_last_turn = 0.0
+        self.map_position = np.array(map_position, dtype=float)
+        self.loan_loss_provisions = 0.0
+        self.failed = False
+
+    def net_worth(
+        self,
+        credit_market: "CreditMarket",
+        equity_market: "EquityMarket",
+    ) -> float:
+        return super().net_worth(credit_market, equity_market) - self.deposits - self.loan_loss_provisions
+
+    def risk_weighted_assets(
+        self,
+        credit_market: "CreditMarket",
+        equity_market: "EquityMarket",
+    ) -> float:
+        performing = 0.0
+        delinquent = 0.0
+        for loan_id in self.loans_lent:
+            loan = credit_market.loans.get(loan_id)
+            if loan is None or loan.status not in {"active", "delinquent", "restructured"}:
+                continue
+            if loan.status == "delinquent" or loan.missed_payments >= 2:
+                delinquent += loan.outstanding
+            else:
+                performing += loan.outstanding
+        equity_assets = self.equity_value(equity_market)
+        return float(0.85 * performing + 1.45 * delinquent + 1.7 * equity_assets + 0.10 * self.cash)
+
+    def update_provisions(self, credit_market: "CreditMarket") -> None:
+        expected = 0.0
+        for loan_id in self.loans_lent:
+            loan = credit_market.loans.get(loan_id)
+            if loan is None or loan.status not in {"active", "delinquent", "restructured"}:
+                continue
+            provision_rate = 0.035
+            if loan.status == "restructured":
+                provision_rate = 0.12
+            if loan.status == "delinquent" or loan.missed_payments >= 2:
+                provision_rate = 0.32
+            expected += loan.outstanding * provision_rate
+        self.loan_loss_provisions = 0.55 * self.loan_loss_provisions + 0.45 * expected
+
+    def capital_ratio(
+        self,
+        credit_market: "CreditMarket",
+        equity_market: "EquityMarket",
+    ) -> float:
+        risk_weighted_assets = self.risk_weighted_assets(credit_market, equity_market)
+        return self.net_worth(credit_market, equity_market) / max(risk_weighted_assets, 1.0)
+
+    def pay_deposit_interest(
+        self,
+        market_reference_rate: float,
+        config: SimulationConfig,
+    ) -> float:
+        # Riskier banks must offer more to retain private funding.
+        confidence_spread = 0.035 * max(0.0, 0.90 - self.deposit_confidence)
+        self.deposit_rate_annual = max(
+            0.0,
+            0.62 * market_reference_rate + confidence_spread,
+        )
+        periodic = RateMath.nominal_to_periodic(
+            self.deposit_rate_annual,
+            config.periods_per_year,
+            config.periods_per_year,
+        )
+        cost = self.deposits * periodic
+        self.cash -= cost
+        return float(cost)
+
+    def process_private_run(
+        self,
+        credit_market: "CreditMarket",
+        equity_market: "EquityMarket",
+        market_reference_rate: float,
+    ) -> Tuple[float, float]:
+        """Aggregate depositor withdrawals driven by observable private risk."""
+        if self.failed or not self.alive or self.deposits <= 0:
+            return 0.0, 0.0
+        capital_ratio = self.capital_ratio(credit_market, equity_market)
+        liquidity_ratio = self.cash / max(self.deposits, 1.0)
+        npl_exposure = 0.0
+        total_exposure = 0.0
+        for loan_id in self.loans_lent:
+            loan = credit_market.loans.get(loan_id)
+            if loan is None or loan.status not in {"active", "delinquent", "restructured"}:
+                continue
+            total_exposure += loan.outstanding
+            if loan.status == "delinquent" or loan.missed_payments >= 2:
+                npl_exposure += loan.outstanding
+        own_npl = npl_exposure / max(total_exposure, 1.0)
