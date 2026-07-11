@@ -1,0 +1,208 @@
+        recorded_shares = 0.0
+        holders: List[Tuple[BaseAgent, EquityPosition]] = []
+        for agent in agents_by_id.values():
+            position = agent.equity_positions.get(firm.id)
+            if agent.alive and position is not None and position.shares > 0:
+                holders.append((agent, position))
+                recorded_shares += position.shares
+        if recorded_shares <= 0:
+            return 0.0
+        distributable = min(amount, firm.cash)
+        firm.cash -= distributable
+        for agent, position in holders:
+            share = position.shares / recorded_shares
+            agent.cash += distributable * share
+        if recap:
+            self.recap_dividends_last_turn += distributable
+        else:
+            self.dividends_paid_last_turn += distributable
+        return float(distributable)
+
+    def wipe_out_firm(self, firm: Firm, agents: Iterable[BaseAgent]) -> None:
+        for agent in agents:
+            if firm.id in agent.equity_positions:
+                del agent.equity_positions[firm.id]
+        self.previous_prices[firm.id] = self.prices.get(firm.id, 0.0)
+        self.prices[firm.id] = 0.0
+
+    def mark_to_market(
+        self,
+        credit_market: "CreditMarket",
+        inflation_annual: float,
+    ) -> None:
+        self.previous_prices = dict(self.prices)
+        for firm_id, firm in self.firms.items():
+            if not firm.alive:
+                self.prices[firm_id] = 0.0
+                continue
+            profit = firm.rolling_profit()
+            sales = max(float(np.mean(firm.sales_history[-6:])), 0.0) if firm.sales_history else 0.0
+            debt = firm.debt_outstanding(credit_market)
+            book_equity = max(
+                0.0,
+                firm.cash + 0.76 * firm.productive_capital + 0.55 * firm.inventory * firm.goods_price - debt,
+            )
+            earnings_value = 10.0 * max(profit, 0.0)
+            revenue_value = 0.70 * sales
+            fundamental = max(
+                0.03,
+                (book_equity + earnings_value + revenue_value) / max(firm.shares_outstanding, 1.0),
+            )
+            flow = self.order_flow.get(firm_id, 0.0)
+            flow_impact = math.exp(
+                np.clip(
+                    self.config.equity_price_impact
+                    * flow
+                    / max(self.config.equity_market_depth, 1.0),
+                    -0.35,
+                    0.25,
+                )
+            )
+            leverage_penalty = 1.0 / (1.0 + 0.08 * debt / max(book_equity, 0.5))
+            sentiment = np.clip(firm.market_sentiment, 0.45, 1.65)
+            noise = math.exp(self.rng.normal(0.0, 0.012))
+            inflation_drift = (1.0 + inflation_annual) ** (1.0 / 12.0)
+            previous = max(self.prices.get(firm_id, fundamental), 0.03)
+            target = fundamental * flow_impact * leverage_penalty * sentiment * noise
+            self.prices[firm_id] = float(
+                np.clip(0.68 * previous * inflation_drift + 0.32 * target, 0.01, 30.0)
+            )
+            firm.market_sentiment = 0.985 * firm.market_sentiment + 0.015
+        self.order_flow.clear()
+
+    def reset_turn_flows(self) -> None:
+        self.dividends_paid_last_turn = 0.0
+        self.recap_dividends_last_turn = 0.0
+        self.total_primary_investment_last_turn = 0.0
+
+
+# ============================================================
+# CREDIT MARKET
+# ============================================================
+
+
+@dataclass
+class LoanContract:
+    loan_id: int
+    lender_id: str
+    borrower_id: str
+    original_principal: float
+    outstanding: float
+    annual_nominal_rate: float
+    nominal_compounds_per_year: int
+    payments_per_year: int
+    original_term_periods: int
+    remaining_periods: int
+    amortization: str
+    purpose: str
+    seniority: str
+    collateral_type: str
+    collateral_value: float
+    covenant_max_leverage: float
+    origination_turn: int
+    sponsor_id: Optional[str] = None
+    grace_periods: int = 0
+    status: str = "active"
+    missed_payments: int = 0
+    accrued_interest: float = 0.0
+    total_interest_paid: float = 0.0
+    total_principal_paid: float = 0.0
+    recovery_received: float = 0.0
+
+    @property
+    def periodic_rate(self) -> float:
+        return RateMath.nominal_to_periodic(
+            self.annual_nominal_rate,
+            self.nominal_compounds_per_year,
+            self.payments_per_year,
+        )
+
+    def scheduled_due(self) -> Tuple[float, float, float]:
+        interest = self.outstanding * self.periodic_rate + self.accrued_interest
+        if self.grace_periods > 0:
+            return interest, 0.0, interest
+        if self.amortization == "bullet":
+            principal = self.outstanding if self.remaining_periods <= 1 else 0.0
+            return principal + interest, principal, interest
+        if self.amortization == "interest_only":
+            principal = self.outstanding if self.remaining_periods <= 1 else 0.0
+            return principal + interest, principal, interest
+        payment = RateMath.annuity_payment(
+            self.outstanding,
+            self.periodic_rate,
+            self.remaining_periods,
+        )
+        principal = max(0.0, min(self.outstanding, payment - interest))
+        return principal + interest, principal, interest
+
+
+@dataclass
+class CreditOffer:
+    lender_id: str
+    amount: float
+    minimum_annual_rate: float
+    accepted_seniorities: Tuple[str, ...] = ("secured", "senior", "junior")
+
+
+@dataclass
+class CreditApplication:
+    borrower_id: str
+    amount: float
+    maximum_annual_rate: float
+    term_periods: int
+    amortization: str
+    purpose: str
+    seniority: str
+    collateral_type: str
+    collateral_value: float
+    covenant_max_leverage: float
+    sponsor_id: Optional[str] = None
+    grace_periods: int = 0
+
+
+class CreditMarket:
+    def __init__(self, config: SimulationConfig):
+        self.config = config
+        self.loans: Dict[int, LoanContract] = {}
+        self.offers: List[CreditOffer] = []
+        self.applications: List[CreditApplication] = []
+        self.next_loan_id = 1
+        self.new_loan_rates: List[float] = []
+        self.originated_last_turn: List[int] = []
+        self.interest_paid_last_turn = 0.0
+        self.principal_paid_last_turn = 0.0
+        self.credit_losses_last_turn = 0.0
+        self.recoveries_last_turn = 0.0
+        self.reference_rate_annual = float(config.initial_market_rate_annual)
+        self.credit_demand_last_turn = 0.0
+        self.credit_supply_last_turn = 0.0
+
+    @property
+    def active_loans(self) -> List[LoanContract]:
+        return [
+            loan
+            for loan in self.loans.values()
+            if loan.status in {"active", "delinquent", "restructured"}
+            and loan.outstanding > 1e-8
+        ]
+
+    def register_offer(self, offer: CreditOffer) -> None:
+        if offer.amount > 0:
+            self.offers.append(offer)
+
+    def register_application(self, application: CreditApplication) -> None:
+        if application.amount <= 0:
+            return
+        if any(app.borrower_id == application.borrower_id for app in self.applications):
+            return
+        self.applications.append(application)
+
+    def update_private_reference_rate(self, inflation_annual: float) -> float:
+        """Endogenous benchmark from private credit scarcity, losses and inflation."""
+        demand = float(sum(application.amount for application in self.applications))
+        supply = float(sum(offer.amount for offer in self.offers))
+        self.credit_demand_last_turn = demand
+        self.credit_supply_last_turn = supply
+        scarcity = math.tanh((demand - supply) / max(demand + supply, 1.0))
+        stress = self.nonperforming_ratio()
+        target = (
