@@ -1,0 +1,191 @@
+        self.operating_profit_last_turn = 0.0
+        self.cash_flow_last_turn = 0.0
+        self.profit_history: List[float] = []
+        self.sales_history: List[float] = []
+        self.price_history: List[float] = [self.goods_price]
+        self.employees: List[str] = []
+        self.job_slots = 0
+        self.wage_offer = 1.0
+        self.generation = generation
+        self.age = 0
+        self.restructuring_count = 0
+        self.shares_outstanding = 100.0
+        self.market_sentiment = 1.0
+        self.governance_boost = 0.0
+        self.pending_dividend_recap_sponsor: Optional[str] = None
+        self.last_recap_turn = -999
+        self.insolvency_state = "none"
+
+    @property
+    def strategy(self) -> str:
+        return classify_firm_strategy(self.traits)
+
+    def net_worth(
+        self,
+        credit_market: "CreditMarket",
+        equity_market: "EquityMarket",
+    ) -> float:
+        return (
+            super().net_worth(credit_market, equity_market)
+            + 0.76 * self.productive_capital
+            + 0.62 * self.inventory * self.goods_price
+        )
+
+    def liquidation_value(self, config: SimulationConfig) -> float:
+        return max(
+            0.0,
+            self.cash
+            + config.liquidation_discount_capital * self.productive_capital
+            + config.liquidation_discount_inventory * self.inventory * self.goods_price,
+        )
+
+    def rolling_profit(self, window: int = 6) -> float:
+        return float(np.mean(self.profit_history[-window:])) if self.profit_history else 0.0
+
+    def rolling_growth(self, window: int = 5) -> float:
+        history = self.sales_history[-window:]
+        if len(history) < 2 or abs(history[0]) < 1e-9:
+            return 0.0
+        return float((history[-1] / max(history[0], 1e-6)) ** (1 / (len(history) - 1)) - 1)
+
+    def credit_features(
+        self,
+        credit_market: "CreditMarket",
+        equity_market: "EquityMarket",
+    ) -> Dict[str, float]:
+        equity = max(self.net_worth(credit_market, equity_market), 0.5)
+        debt = self.debt_outstanding(credit_market)
+        profit = self.rolling_profit()
+        return {
+            "leverage": debt / equity,
+            "profitability": profit / max(self.productive_capital, 1.0),
+            "liquidity": self.cash / max(self.wage_bill_last_turn + 1.0, 1.0),
+            "stability": self.credit_score + 0.15 * min(self.age / 24.0, 1.0),
+        }
+
+    def choose_location(
+        self,
+        landscape: EconomicLandscape,
+        occupancy: Dict[Tuple[int, int], int],
+        rng: np.random.Generator,
+        movement_cost: float,
+    ) -> None:
+        if not self.alive:
+            return
+        rows, cols = landscape.resources.shape
+        moves = [np.array([dr, dc]) for dr in (-1, 0, 1) for dc in (-1, 0, 1)]
+        best_move = np.array([0, 0])
+        best_score = -np.inf
+        current = tuple(self.position.tolist())
+        resource_std = max(float(np.std(landscape.resources)), 0.1)
+        for move in moves:
+            nr, nc = self.position + move
+            if not (0 <= nr < rows and 0 <= nc < cols):
+                continue
+            opportunity = landscape.resources[nr, nc]
+            congestion = occupancy.get((int(nr), int(nc)), 0)
+            exploration = rng.normal(0.0, self.traits.exploration * resource_std)
+            switching_cost = movement_cost if np.any(move != 0) else 0.0
+            score = (
+                opportunity * self.productivity
+                - 0.30 * congestion
+                - switching_cost
+                + exploration
+            )
+            if score > best_score:
+                best_score = score
+                best_move = move
+        self.position += best_move
+        if tuple(self.position.tolist()) != current:
+            self.cash -= movement_cost
+
+    def plan_labor(self, labor_scarcity: float, config: SimulationConfig) -> None:
+        recent_sales = float(np.mean(self.sales_history[-4:])) if self.sales_history else 2.0
+        desired_output = 1.5 + 0.48 * recent_sales + 0.18 * self.productive_capital
+        inventory_pressure = max(0.25, 1.0 - self.inventory / max(desired_output, 1.0))
+        desired_labor = desired_output * self.traits.labor_intensity * inventory_pressure
+        self.job_slots = int(np.clip(math.ceil(desired_labor / 2.2), 0, 9))
+        productivity_wage = 0.16 * math.log1p(self.productive_capital)
+        scarcity_premium = 0.35 * max(labor_scarcity - 0.45, 0.0)
+        self.wage_offer = config.base_wage * (
+            0.78 + productivity_wage + scarcity_premium + 0.08 * self.productivity
+        )
+        if self.cash < self.wage_offer * 1.3:
+            self.job_slots = 0
+
+    def produce(
+        self,
+        worker_effective_labor: float,
+        wage_bill: float,
+        landscape: EconomicLandscape,
+    ) -> float:
+        if not self.alive:
+            return 0.0
+        row, col = self.position
+        opportunity = landscape.opportunity(int(row), int(col))
+        capital_input = max(self.productive_capital, 0.2) ** 0.38
+        labor_input = max(worker_effective_labor, 0.05) ** 0.56
+        potential = (
+            0.60
+            * self.productivity
+            * (1.0 + self.governance_boost)
+            * capital_input
+            * labor_input
+            * (0.65 + 0.05 * opportunity)
+        )
+        resource_needed = 0.32 * potential
+        extracted = landscape.extract(int(row), int(col), resource_needed)
+        resource_ratio = extracted / max(resource_needed, 1e-9)
+        output = potential * min(resource_ratio, 1.0)
+        maintenance = 0.014 * self.productive_capital
+        logistics = 0.026 * output
+        total_cost = wage_bill + maintenance + logistics
+        self.cash -= total_cost
+        self.inventory += output
+        self.productive_capital *= 0.994
+        self.output_last_turn = float(output)
+        self.wage_bill_last_turn = float(wage_bill)
+        return float(output)
+
+    def update_price(self, aggregate_inflation: float, rng: np.random.Generator) -> None:
+        stock_target = 2.0 + 0.35 * max(self.units_sold_last_turn, 1.0)
+        inventory_gap = (stock_target - self.inventory) / max(stock_target, 1.0)
+        cost_floor = 0.55 + 0.18 * self.wage_offer
+        desired = max(
+            cost_floor,
+            self.goods_price
+            * (1.0 + 0.07 * inventory_gap + aggregate_inflation / 12.0)
+            * (1.0 + 0.02 * self.traits.markup),
+        )
+        desired *= math.exp(rng.normal(0.0, 0.008))
+        self.goods_price = float(np.clip(0.72 * self.goods_price + 0.28 * desired, 0.35, 8.0))
+        self.price_history.append(self.goods_price)
+        self.price_history = self.price_history[-36:]
+
+    def close_accounts(self, revenue: float) -> None:
+        operating_cost = self.wage_bill_last_turn + 0.014 * self.productive_capital
+        operating_profit = revenue - operating_cost
+        self.sales_last_turn = float(revenue)
+        self.operating_profit_last_turn = float(operating_profit)
+        self.cash_flow_last_turn = float(operating_profit)
+        self.profit_history.append(float(operating_profit))
+        self.sales_history.append(float(revenue))
+        self.profit_history = self.profit_history[-24:]
+        self.sales_history = self.sales_history[-24:]
+        self.age += 1
+
+    def invest_retained_earnings(self) -> float:
+        if not self.alive:
+            return 0.0
+        buffer = 2.5 + 1.2 * max(self.wage_bill_last_turn, 0.5)
+        investable = max(0.0, self.cash - buffer)
+        investment = investable * self.traits.investment_rate
+        self.cash -= investment
+        self.productive_capital += investment
+        return float(investment)
+
+
+class Household(BaseAgent):
+    def __init__(
+        self,
+        agent_id: str,
