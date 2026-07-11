@@ -1,0 +1,196 @@
+                available -= payment
+                if lender is not None and lender.alive:
+                    if isinstance(lender, Bank):
+                        # Repayment destroys bank-created deposits; interest becomes bank equity.
+                        lender.deposits = max(0.0, lender.deposits - payment)
+                    else:
+                        lender.cash += payment
+                loan.total_interest_paid += interest_paid
+                loan.total_principal_paid += principal_paid
+                loan.outstanding = max(0.0, loan.outstanding - principal_paid)
+                self.interest_paid_last_turn += interest_paid
+                self.principal_paid_last_turn += principal_paid
+
+                unpaid_interest = max(0.0, interest_due - interest_paid)
+                loan.accrued_interest = unpaid_interest
+
+                if payment + 1e-8 < total:
+                    loan.missed_payments += 1
+                    loan.status = "delinquent"
+                    borrower.status = "delinquent"
+                    borrower.credit_score = max(0.05, borrower.credit_score - 0.055)
+                else:
+                    loan.missed_payments = max(0, loan.missed_payments - 1)
+                    if loan.status == "delinquent":
+                        loan.status = "active"
+                    borrower.credit_score = min(0.98, borrower.credit_score + 0.006)
+
+                if loan.grace_periods > 0:
+                    loan.grace_periods -= 1
+                loan.remaining_periods -= 1
+                if loan.outstanding <= 1e-7:
+                    loan.outstanding = 0.0
+                    loan.status = "repaid"
+                elif loan.remaining_periods <= 0 and loan.outstanding > 1e-7:
+                    loan.missed_payments += 1
+                    loan.status = "delinquent"
+
+            max_missed = max((loan.missed_payments for loan in loans), default=0)
+            if max_missed >= self.config.distress_missed_payment_threshold:
+                distressed.append(borrower_id)
+
+        return distressed
+
+    def outstanding_credit(self) -> float:
+        return float(sum(loan.outstanding for loan in self.active_loans))
+
+    def nonperforming_ratio(self) -> float:
+        total = self.outstanding_credit()
+        if total <= 1e-12:
+            return 0.0
+        npl = sum(
+            loan.outstanding
+            for loan in self.active_loans
+            if loan.status == "delinquent" or loan.missed_payments >= 2
+        )
+        return float(npl / total)
+
+    def reset_turn_flows(self) -> None:
+        self.credit_losses_last_turn = 0.0
+        self.recoveries_last_turn = 0.0
+
+
+# ============================================================
+# BANKRUPTCY AND RESOLUTION
+# ============================================================
+
+
+class InsolvencyEngine:
+    def __init__(self, config: SimulationConfig):
+        self.config = config
+        self.reorganizations_last_turn = 0
+        self.liquidations_last_turn = 0
+        self.household_defaults_last_turn = 0
+
+    def reset(self) -> None:
+        self.reorganizations_last_turn = 0
+        self.liquidations_last_turn = 0
+        self.household_defaults_last_turn = 0
+
+    def should_resolve(
+        self,
+        agent: BaseAgent,
+        credit_market: CreditMarket,
+        equity_market: EquityMarket,
+    ) -> bool:
+        active = [
+            credit_market.loans[loan_id]
+            for loan_id in agent.loans_borrowed
+            if loan_id in credit_market.loans
+            and credit_market.loans[loan_id].status
+            in {"active", "delinquent", "restructured"}
+        ]
+        max_missed = max((loan.missed_payments for loan in active), default=0)
+        insolvency_floor = -1.0 if isinstance(agent, Household) else -2.5
+        insolvent = agent.net_worth(credit_market, equity_market) < insolvency_floor
+        maturity_default = any(
+            loan.remaining_periods <= 0 and loan.outstanding > 1e-7 for loan in active
+        )
+        return (
+            max_missed >= self.config.bankruptcy_missed_payment_threshold
+            or insolvent
+            or maturity_default
+        )
+
+    def resolve(
+        self,
+        agent: BaseAgent,
+        agents_by_id: Dict[str, BaseAgent],
+        credit_market: CreditMarket,
+        equity_market: EquityMarket,
+        turn: int,
+    ) -> str:
+        if not agent.alive:
+            return "already_dead"
+        if isinstance(agent, Household):
+            return self._household_bankruptcy(
+                agent, agents_by_id, credit_market, equity_market, turn
+            )
+        if isinstance(agent, Firm):
+            going_concern = self._going_concern_value(agent, credit_market)
+            liquidation = agent.liquidation_value(self.config)
+            if agent.rolling_profit() > 0.0 and going_concern > 1.12 * liquidation:
+                return self._reorganize_firm(
+                    agent, agents_by_id, credit_market, equity_market, turn
+                )
+        return self._liquidate(
+            agent, agents_by_id, credit_market, equity_market, turn
+        )
+
+    def _going_concern_value(self, firm: Firm, credit_market: CreditMarket) -> float:
+        profit = max(firm.rolling_profit(), 0.0)
+        debt = firm.debt_outstanding(credit_market)
+        return float(
+            8.5 * profit
+            + 0.72 * firm.productive_capital
+            + 0.45 * firm.inventory * firm.goods_price
+            - 0.30 * debt
+        )
+
+    def _household_bankruptcy(
+        self,
+        household: Household,
+        agents_by_id: Dict[str, BaseAgent],
+        credit_market: CreditMarket,
+        equity_market: EquityMarket,
+        turn: int,
+    ) -> str:
+        active = [
+            credit_market.loans[loan_id]
+            for loan_id in household.loans_borrowed
+            if loan_id in credit_market.loans
+            and credit_market.loans[loan_id].status
+            in {"active", "delinquent", "restructured"}
+        ]
+        # Private forbearance: no principal forgiveness or public discharge.
+        # Lenders extend only when wage income makes delayed recovery plausible.
+        debt_service_capacity = 5.0 * max(household.wage_income_last_turn, 0.0) + household.cash
+        total_claim = sum(loan.outstanding + loan.accrued_interest for loan in active)
+        if (
+            household.hardship_restructures < 1
+            and household.employer_id is not None
+            and debt_service_capacity > 0.28 * total_claim
+        ):
+            for loan in active:
+                loan.outstanding += loan.accrued_interest
+                loan.accrued_interest = 0.0
+                loan.remaining_periods = max(loan.remaining_periods + 6, 8)
+                loan.annual_nominal_rate = max(
+                    loan.annual_nominal_rate,
+                    credit_market.reference_rate_annual + 0.055,
+                )
+                loan.missed_payments = 0
+                loan.status = "restructured"
+            household.hardship_restructures += 1
+            household.status = "private_workout"
+            household.credit_score = max(0.05, household.credit_score - 0.20)
+            self.reorganizations_last_turn += 1
+            return "private_household_workout"
+
+        self.household_defaults_last_turn += 1
+        return self._liquidate(
+            household, agents_by_id, credit_market, equity_market, turn
+        )
+
+    def _reorganize_firm(
+        self,
+        firm: Firm,
+        agents_by_id: Dict[str, BaseAgent],
+        credit_market: CreditMarket,
+        equity_market: EquityMarket,
+        turn: int,
+    ) -> str:
+        active = [
+            credit_market.loans[loan_id]
+            for loan_id in firm.loans_borrowed
+            if loan_id in credit_market.loans
