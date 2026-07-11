@@ -1,0 +1,187 @@
+            self.config.private_time_preference_annual
+            + 0.42 * max(inflation_annual, -0.02)
+            + 0.085 * scarcity
+            + 0.24 * stress
+        )
+        self.reference_rate_annual = float(
+            np.clip(
+                0.74 * self.reference_rate_annual + 0.26 * target,
+                max(self.config.private_time_preference_annual, 0.001),
+                0.75,
+            )
+        )
+        return self.reference_rate_annual
+
+    def estimated_pd(
+        self,
+        borrower: BaseAgent,
+        equity_market: EquityMarket,
+    ) -> float:
+        features = borrower.credit_features(self, equity_market)
+        z = (
+            -2.55
+            + 0.80 * features["leverage"]
+            - 0.95 * features["profitability"]
+            - 0.30 * min(features["liquidity"], 4.0)
+            - 0.65 * features["stability"]
+            + 0.35 * borrower.bankruptcy_count
+        )
+        return float(np.clip(1.0 / (1.0 + math.exp(-np.clip(z, -15, 15))), 0.005, 0.72))
+
+    def price_application(
+        self,
+        application: CreditApplication,
+        lender: BaseAgent,
+        borrower: BaseAgent,
+        equity_market: EquityMarket,
+    ) -> float:
+        pd = self.estimated_pd(borrower, equity_market)
+        collateral_coverage = application.collateral_value / max(application.amount, 1e-9)
+        lgd = {
+            "secured": 0.35,
+            "senior": 0.58,
+            "junior": 0.82,
+        }.get(application.seniority, 0.72)
+        lgd *= max(0.30, 1.0 - 0.45 * min(collateral_coverage, 1.5))
+        expected_loss = pd * lgd
+        term_years = application.term_periods / self.config.periods_per_year
+        term_premium = 0.006 * math.sqrt(max(term_years, 0.1))
+        purpose_spread = {
+            "productive investment": 0.010,
+            "working capital": 0.016,
+            "consumer hardship": 0.060,
+            "fund leverage": 0.035,
+            "dividend recap": 0.075,
+            "restructuring facility": 0.045,
+        }.get(application.purpose, 0.025)
+        lender_margin = 0.012
+        if isinstance(lender, Bank):
+            lender_margin += 0.018 * (1.0 - lender.risk_appetite)
+        return float(
+            self.reference_rate_annual
+            + lender_margin
+            + term_premium
+            + purpose_spread
+            + 1.30 * expected_loss
+        )
+
+    def clear(
+        self,
+        agents_by_id: Dict[str, BaseAgent],
+        equity_market: EquityMarket,
+        turn: int,
+    ) -> List[LoanContract]:
+        self.new_loan_rates = []
+        self.originated_last_turn = []
+        originated: List[LoanContract] = []
+        self.offers.sort(key=lambda offer: offer.minimum_annual_rate)
+        applications = sorted(
+            self.applications,
+            key=lambda app: app.maximum_annual_rate,
+            reverse=True,
+        )
+
+        for application in applications:
+            borrower = agents_by_id.get(application.borrower_id)
+            if borrower is None or not borrower.alive:
+                continue
+            for offer in self.offers:
+                lender = agents_by_id.get(offer.lender_id)
+                if lender is None or not lender.alive:
+                    continue
+                if application.seniority not in offer.accepted_seniorities:
+                    continue
+                if isinstance(lender, Bank):
+                    available = offer.amount
+                else:
+                    available = min(offer.amount, lender.cash)
+                if available + 1e-9 < application.amount:
+                    continue
+                priced_rate = max(
+                    offer.minimum_annual_rate,
+                    self.price_application(
+                        application, lender, borrower, equity_market
+                    ),
+                )
+                if priced_rate > application.maximum_annual_rate:
+                    continue
+
+                if isinstance(lender, Bank):
+                    # Simplified endogenous bank money: the loan creates a matching deposit.
+                    lender.deposits += application.amount
+                else:
+                    lender.cash -= application.amount
+                borrower.cash += application.amount
+                offer.amount -= application.amount
+                loan = LoanContract(
+                    loan_id=self.next_loan_id,
+                    lender_id=lender.id,
+                    borrower_id=borrower.id,
+                    original_principal=application.amount,
+                    outstanding=application.amount,
+                    annual_nominal_rate=priced_rate,
+                    nominal_compounds_per_year=self.config.periods_per_year,
+                    payments_per_year=self.config.periods_per_year,
+                    original_term_periods=application.term_periods,
+                    remaining_periods=application.term_periods,
+                    amortization=application.amortization,
+                    purpose=application.purpose,
+                    seniority=application.seniority,
+                    collateral_type=application.collateral_type,
+                    collateral_value=application.collateral_value,
+                    covenant_max_leverage=application.covenant_max_leverage,
+                    origination_turn=turn,
+                    sponsor_id=application.sponsor_id,
+                    grace_periods=application.grace_periods,
+                )
+                self.loans[loan.loan_id] = loan
+                lender.loans_lent.append(loan.loan_id)
+                borrower.loans_borrowed.append(loan.loan_id)
+                self.next_loan_id += 1
+                self.new_loan_rates.append(priced_rate)
+                self.originated_last_turn.append(loan.loan_id)
+                originated.append(loan)
+                break
+
+        self.offers.clear()
+        self.applications.clear()
+        return originated
+
+    def settle_period(
+        self,
+        agents_by_id: Dict[str, BaseAgent],
+        equity_market: EquityMarket,
+    ) -> List[str]:
+        self.interest_paid_last_turn = 0.0
+        self.principal_paid_last_turn = 0.0
+        distressed: List[str] = []
+        borrower_loans: Dict[str, List[LoanContract]] = defaultdict(list)
+        for loan in self.active_loans:
+            borrower_loans[loan.borrower_id].append(loan)
+
+        for borrower_id, loans in borrower_loans.items():
+            borrower = agents_by_id.get(borrower_id)
+            if borrower is None or not borrower.alive:
+                continue
+            borrower_features = borrower.credit_features(self, equity_market)
+            for loan in loans:
+                if borrower_features["leverage"] > loan.covenant_max_leverage:
+                    loan.annual_nominal_rate = min(0.65, loan.annual_nominal_rate + 0.012)
+                    if borrower_features["leverage"] > 1.35 * loan.covenant_max_leverage:
+                        loan.missed_payments += 1
+                        loan.status = "delinquent"
+            dues = [loan.scheduled_due() for loan in loans]
+            total_due = float(sum(due[0] for due in dues))
+            borrower.raise_liquidity(total_due, equity_market)
+            available = max(borrower.cash, 0.0)
+
+            for loan, (total, principal_due, interest_due) in sorted(
+                zip(loans, dues),
+                key=lambda item: {"secured": 0, "senior": 1, "junior": 2}.get(item[0].seniority, 3),
+            ):
+                lender = agents_by_id.get(loan.lender_id)
+                payment = min(available, total)
+                interest_paid = min(payment, interest_due)
+                principal_paid = min(max(payment - interest_paid, 0.0), principal_due)
+
+                borrower.cash -= payment
