@@ -1,0 +1,214 @@
+        total_units = 0.0
+
+        for household in [h for h in households if h.alive]:
+            energy_need = max(0.0, 0.92 - household.energy)
+            precaution = 0.22 + 0.32 * household.risk_aversion
+            disposable = max(0.0, household.cash - precaution)
+            budget = min(
+                disposable * household.consumption_propensity,
+                0.50 + 4.6 * energy_need,
+            )
+            if budget <= 0.01 or not sellers:
+                continue
+
+            sampled = sellers if len(sellers) <= 18 else list(rng.choice(sellers, size=18, replace=False))
+            scored: List[Tuple[float, Firm]] = []
+            for firm in sampled:
+                if firm.inventory <= 0.01:
+                    continue
+                commute = distance(household.position, firm.position)
+                score = (
+                    -firm.goods_price
+                    - 0.012 * commute
+                    + 0.05 * firm.productivity
+                    + rng.normal(0.0, 0.015)
+                )
+                scored.append((score, firm))
+            if not scored:
+                continue
+            scored.sort(key=lambda pair: pair[0], reverse=True)
+            firm = scored[0][1]
+            max_units_needed = max(0.15, energy_need / max(config.energy_per_good, 1e-9))
+            units = min(
+                firm.inventory,
+                budget / max(firm.goods_price, 1e-9),
+                max_units_needed,
+            )
+            if units <= 0:
+                continue
+            spending = units * firm.goods_price
+            household.cash -= spending
+            household.energy += units * config.energy_per_good
+            household.energy = float(np.clip(household.energy, 0.0, 1.25))
+            household.consumption_last_turn += spending
+            household.goods_consumed_last_turn += units
+            firm.inventory -= units
+            firm.units_sold_last_turn += units
+            firm_revenue[firm.id] += spending
+            total_consumption += spending
+            total_units += units
+
+        return float(total_consumption), float(total_units), firm_revenue
+
+
+# ============================================================
+# SIMULATION ENGINE
+# ============================================================
+
+
+class EconomicSimulation:
+    def __init__(self, config: SimulationConfig):
+        self.config = config
+        self.rng = np.random.default_rng(config.seed)
+        self.turn = 0
+        self.landscape = EconomicLandscape(config, self.rng)
+        self.credit_market = CreditMarket(config)
+        self.equity_market = EquityMarket(config, self.rng)
+        self.insolvency = InsolvencyEngine(config)
+        self.labor_market = LaborMarket()
+        self.consumption_market = ConsumptionMarket()
+
+        self.firms: List[Firm] = []
+        self.households: List[Household] = []
+        self.banks: List[Bank] = []
+        self.funds: List[InvestmentFund] = []
+        self.next_firm_id = 0
+        self.next_household_id = 0
+        self.next_bank_id = 0
+        self.bank_failures_last_turn = 0
+        self.bank_run_withdrawals_last_turn = 0.0
+        self.unmet_bank_withdrawals_last_turn = 0.0
+        self.deposit_losses_last_turn = 0.0
+
+        for _ in range(config.firms):
+            firm = self._new_firm()
+            self.firms.append(firm)
+            self.equity_market.register_firm(firm)
+        for _ in range(config.households):
+            self.households.append(self._new_household())
+
+        center = (config.grid_size - 1) / 2.0
+        radius = config.grid_size * 0.44
+        for index in range(config.banks):
+            angle = 2 * math.pi * index / max(config.banks, 1)
+            position = (
+                center + radius * math.sin(angle),
+                center + radius * math.cos(angle),
+            )
+            self.banks.append(Bank(f"B{self.next_bank_id}", self.rng, position))
+            self.next_bank_id += 1
+
+        for index in range(config.funds):
+            strategy = FUND_STRATEGIES[index % len(FUND_STRATEGIES)]
+            angle = 2 * math.pi * (index + 0.5) / max(config.funds, 1)
+            position = (
+                center + radius * 0.82 * math.sin(angle),
+                center + radius * 0.82 * math.cos(angle),
+            )
+            self.funds.append(
+                InvestmentFund(f"I{index}", strategy, self.rng, position)
+            )
+
+        self.inflation_annual = config.initial_inflation_annual
+        self.last_distressed_ids: List[str] = []
+        self.last_resolution_events: List[Tuple[str, str]] = []
+        self.network = nx.MultiDiGraph()
+
+        metric_names = [
+            "output",
+            "consumption",
+            "wages",
+            "employment_rate",
+            "average_energy",
+            "household_gini",
+            "firm_gini",
+            "top10_household_share",
+            "credit",
+            "npl_ratio",
+            "mean_new_apr",
+            "interest_paid",
+            "credit_losses",
+            "reorganizations",
+            "liquidations",
+            "household_defaults",
+            "bank_failures",
+            "bank_run_withdrawals",
+            "unmet_bank_withdrawals",
+            "deposit_losses",
+            "market_reference_rate",
+            "equity_index",
+            "primary_equity",
+            "regular_dividends",
+            "recap_dividends",
+            "network_concentration",
+            "network_density",
+            "alive_firms",
+            "alive_households",
+            "price_level",
+            "inflation_annual",
+            "forecast_output",
+            "forecast_error",
+        ]
+        self.history: Dict[str, List[float]] = {name: [] for name in metric_names}
+        self.firm_strategy_history = {
+            name: [] for name in FIRM_STRATEGY_CENTERS
+        }
+        self.fund_strategy_wealth_history = {
+            name: [] for name in FUND_STRATEGIES
+        }
+
+    @property
+    def agents(self) -> List[BaseAgent]:
+        return [*self.firms, *self.households, *self.banks, *self.funds]
+
+    @property
+    def agents_by_id(self) -> Dict[str, BaseAgent]:
+        return {agent.id: agent for agent in self.agents}
+
+    def _new_firm(
+        self,
+        traits: Optional[FirmTraits] = None,
+        position: Optional[Tuple[int, int]] = None,
+        generation: int = 0,
+    ) -> Firm:
+        size = self.config.grid_size
+        if position is None:
+            position = (
+                int(self.rng.integers(0, size)),
+                int(self.rng.integers(0, size)),
+            )
+        firm = Firm(
+            agent_id=f"E{self.next_firm_id}",
+            position=position,
+            traits=traits or random_firm_traits(self.rng),
+            rng=self.rng,
+            generation=generation,
+        )
+        self.next_firm_id += 1
+        return firm
+
+    def _new_household(self) -> Household:
+        size = self.config.grid_size
+        household = Household(
+            f"H{self.next_household_id}",
+            (int(self.rng.integers(0, size)), int(self.rng.integers(0, size))),
+            self.rng,
+        )
+        self.next_household_id += 1
+        return household
+
+    def _occupancy(self) -> Dict[Tuple[int, int], int]:
+        occupancy: Dict[Tuple[int, int], int] = defaultdict(int)
+        for firm in self.firms:
+            if firm.alive:
+                occupancy[tuple(firm.position.tolist())] += 1
+        return occupancy
+
+    def _forecast_output(self) -> float:
+        output = self.history["output"]
+        if not output:
+            return 0.0
+        if len(output) < 4:
+            return output[-1]
+        window = np.asarray(output[-8:], dtype=float)
+        trend = float(np.mean(np.diff(window))) if len(window) > 1 else 0.0
