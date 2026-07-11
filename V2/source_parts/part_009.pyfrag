@@ -1,0 +1,192 @@
+            and credit_market.loans[loan_id].status
+            in {"active", "delinquent", "restructured"}
+        ]
+        for loan in active:
+            haircut = {"secured": 0.07, "senior": 0.20, "junior": 0.42}.get(
+                loan.seniority, 0.28
+            )
+            debt_equity_fraction = {
+                "secured": 0.03,
+                "senior": 0.12,
+                "junior": 0.28,
+            }.get(loan.seniority, 0.15)
+            lender = agents_by_id.get(loan.lender_id)
+            conversion_amount = loan.outstanding * debt_equity_fraction
+            haircut_amount = loan.outstanding * haircut
+            loan.outstanding = max(
+                0.0, loan.outstanding - conversion_amount - haircut_amount
+            )
+            credit_market.credit_losses_last_turn += haircut_amount
+            if lender is not None and lender.alive and conversion_amount > 0:
+                price = max(equity_market.price_of(firm.id), 0.03)
+                new_shares = conversion_amount / price
+                firm.shares_outstanding += new_shares
+                position = lender.equity_positions.get(firm.id)
+                if position is None:
+                    lender.equity_positions[firm.id] = EquityPosition(
+                        new_shares, conversion_amount, turn
+                    )
+                else:
+                    position.shares += new_shares
+                    position.cost_basis += conversion_amount
+            loan.remaining_periods = max(loan.remaining_periods + 8, 12)
+            loan.annual_nominal_rate = max(
+                credit_market.reference_rate_annual + 0.025,
+                loan.annual_nominal_rate * 0.76,
+            )
+            loan.missed_payments = 0
+            loan.accrued_interest *= 0.25
+            loan.status = "restructured"
+
+        firm.productivity *= 0.94
+        firm.governance_boost = min(0.35, firm.governance_boost + 0.06)
+        firm.restructuring_count += 1
+        firm.bankruptcy_count += 1
+        firm.status = "reorganized"
+        firm.insolvency_state = "reorganized"
+        firm.credit_score = max(0.12, firm.credit_score - 0.22)
+        self.reorganizations_last_turn += 1
+        return "reorganization"
+
+    def _liquidate(
+        self,
+        agent: BaseAgent,
+        agents_by_id: Dict[str, BaseAgent],
+        credit_market: CreditMarket,
+        equity_market: EquityMarket,
+        turn: int,
+    ) -> str:
+        equity_market.liquidate_portfolio(agent, float("inf"))
+        if isinstance(agent, Firm):
+            estate = agent.liquidation_value(self.config)
+        else:
+            estate = max(agent.cash, 0.0)
+        estate *= 1.0 - self.config.liquidation_admin_cost
+        agent.cash = 0.0
+
+        active = [
+            credit_market.loans[loan_id]
+            for loan_id in agent.loans_borrowed
+            if loan_id in credit_market.loans
+            and credit_market.loans[loan_id].status
+            in {"active", "delinquent", "restructured"}
+        ]
+        for seniority in ("secured", "senior", "junior"):
+            tier = [loan for loan in active if loan.seniority == seniority]
+            claim = sum(loan.outstanding + loan.accrued_interest for loan in tier)
+            if claim <= 0:
+                continue
+            payout = min(estate, claim)
+            ratio = payout / claim
+            for loan in tier:
+                lender = agents_by_id.get(loan.lender_id)
+                individual_claim = loan.outstanding + loan.accrued_interest
+                recovery = individual_claim * ratio
+                if lender is not None and lender.alive:
+                    if isinstance(lender, Bank):
+                        lender.deposits = max(0.0, lender.deposits - recovery)
+                    else:
+                        lender.cash += recovery
+                loss = individual_claim - recovery
+                loan.recovery_received += recovery
+                loan.outstanding = 0.0
+                loan.accrued_interest = 0.0
+                loan.status = "defaulted"
+                credit_market.recoveries_last_turn += recovery
+                credit_market.credit_losses_last_turn += loss
+            estate -= payout
+
+        if isinstance(agent, Firm):
+            agent.productive_capital = 0.0
+            agent.inventory = 0.0
+            agent.employees.clear()
+            agent.insolvency_state = "liquidated"
+            equity_market.wipe_out_firm(agent, agents_by_id.values())
+        agent.alive = False
+        agent.status = "liquidated"
+        agent.failure_turn = turn
+        agent.bankruptcy_count += 1
+        self.liquidations_last_turn += 1
+        return "liquidation"
+
+
+# ============================================================
+# MARKETS FOR LABOR AND CONSUMPTION
+# ============================================================
+
+
+class LaborMarket:
+    def match(
+        self,
+        households: List[Household],
+        firms: List[Firm],
+        config: SimulationConfig,
+        rng: np.random.Generator,
+    ) -> Tuple[Dict[str, List[Household]], float, float]:
+        living_households = [h for h in households if h.alive and h.energy > config.minimum_energy]
+        living_firms = [f for f in firms if f.alive]
+        vacancies = sum(f.job_slots for f in living_firms)
+        labor_scarcity = vacancies / max(len(living_households), 1)
+
+        matches: Dict[str, List[Household]] = defaultdict(list)
+        job_list: List[Firm] = []
+        for firm in living_firms:
+            affordable = int(max(0.0, firm.cash - 1.0) / max(firm.wage_offer, 0.1))
+            slots = min(firm.job_slots, affordable)
+            job_list.extend([firm] * slots)
+        rng.shuffle(job_list)
+
+        candidates = sorted(
+            living_households,
+            key=lambda h: (h.energy, h.skill, -h.unemployed_turns),
+            reverse=True,
+        )
+        employed: set[str] = set()
+        wage_total = 0.0
+        effective_labor_total = 0.0
+
+        for firm in job_list:
+            best: Optional[Household] = None
+            best_score = -np.inf
+            for household in candidates:
+                if household.id in employed:
+                    continue
+                commuting = distance(household.position, firm.position)
+                offered = firm.wage_offer * (0.82 + 0.18 * min(household.skill, 2.0))
+                if offered < household.reservation_wage * (0.75 + 0.25 * household.energy):
+                    continue
+                score = offered + 0.32 * household.skill - 0.025 * commuting + rng.normal(0, 0.03)
+                if score > best_score:
+                    best_score = score
+                    best = household
+            if best is None:
+                continue
+            wage = firm.wage_offer * (0.82 + 0.18 * min(best.skill, 2.0))
+            if firm.cash < wage:
+                continue
+            labor = best.work(firm, wage, config)
+            matches[firm.id].append(best)
+            firm.cash -= wage
+            wage_total += wage
+            effective_labor_total += labor
+            employed.add(best.id)
+
+        for household in living_households:
+            if household.id not in employed:
+                household.unemployed_turns += 1
+
+        employment_rate = len(employed) / max(len(living_households), 1)
+        return matches, float(wage_total), float(employment_rate)
+
+
+class ConsumptionMarket:
+    def clear(
+        self,
+        households: List[Household],
+        firms: List[Firm],
+        config: SimulationConfig,
+        rng: np.random.Generator,
+    ) -> Tuple[float, float, Dict[str, float]]:
+        sellers = [f for f in firms if f.alive and f.inventory > 0.02]
+        firm_revenue: Dict[str, float] = defaultdict(float)
+        total_consumption = 0.0
