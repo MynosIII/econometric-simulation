@@ -1,0 +1,50 @@
+    parser.add_argument("--export-csv", type=str, default="")
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    config = SimulationConfig(
+        seed=args.seed,
+        turns=args.turns,
+        grid_size=args.grid,
+        firms=args.firms,
+        households=args.households,
+        banks=args.banks,
+        funds=args.funds,
+        initial_market_rate_annual=args.market_rate,
+        private_time_preference_annual=args.time_preference,
+        structural_break_turn=max(8, int(args.turns * 0.54)),
+        structural_break_severity=float(np.clip(args.shock_severity, 0.0, 0.95)),
+    )
+    simulation = EconomicSimulation(config)
+    dashboard = EconomicDashboard(simulation)
+
+    if args.no_animation:
+        simulation.run()
+        dashboard.draw()
+        if args.snapshot:
+            dashboard.fig.savefig(args.snapshot, dpi=175, bbox_inches="tight")
+        if args.export_csv:
+            simulation.export_csv(args.export_csv)
+        if not args.snapshot:
+            plt.show()
+        return
+
+    animation = dashboard.animate(args.interval)
+    if args.save_gif:
+        animation.save(
+            args.save_gif,
+            writer="pillow",
+            fps=max(1, int(1000 / max(args.interval, 1))),
+        )
+        if args.export_csv:
+            simulation.export_csv(args.export_csv)
+    else:
+        plt.show()
+        if args.export_csv:
+            simulation.export_csv(args.export_csv)
+
+
+if __name__ == "__main__":
+    main()
