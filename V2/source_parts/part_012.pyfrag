@@ -1,0 +1,154 @@
+                + 0.06 * bank.risk_weighted_assets(self.credit_market, self.equity_market)
+            )
+            liquidity_headroom = max(0.0, bank.cash - liquidity_reserve)
+            rwa = bank.risk_weighted_assets(self.credit_market, self.equity_market)
+            private_capital = max(bank.net_worth(self.credit_market, self.equity_market), 0.0)
+            capital_headroom = max(
+                0.0,
+                private_capital / max(bank.target_capital_ratio, 1e-6) - rwa,
+            )
+            lendable_cash = min(liquidity_headroom, capital_headroom)
+            if capital_ratio < bank.minimum_operating_capital_ratio:
+                lendable_cash = 0.0
+                bank.status = "self_preservation"
+            elif capital_ratio < bank.target_capital_ratio:
+                lendable_cash *= 0.18 + 0.18 * bank.risk_appetite
+                bank.status = "capital_cautious"
+            else:
+                lendable_cash *= (
+                    0.40
+                    + 0.30 * bank.risk_appetite
+                    + 0.15 * bank.deposit_confidence
+                )
+                bank.status = "expanding"
+            if bank.deposit_confidence < 0.45:
+                lendable_cash *= 0.08
+            if lendable_cash > 1.0:
+                minimum = (
+                    self.credit_market.reference_rate_annual
+                    + 0.012
+                    + 0.025 * (1.0 - bank.risk_appetite)
+                    + 0.025 * max(0.0, 0.75 - bank.deposit_confidence)
+                )
+                self.credit_market.register_offer(
+                    CreditOffer(
+                        lender_id=bank.id,
+                        amount=lendable_cash,
+                        minimum_annual_rate=minimum,
+                    )
+                )
+
+    def _fund_credit_supply_and_demand(self) -> None:
+        for fund in [f for f in self.funds if f.alive]:
+            equity = max(fund.net_worth(self.credit_market, self.equity_market), 0.5)
+            leverage = fund.debt_outstanding(self.credit_market) / equity
+            if fund.cash > 18.0 and fund.strategy in {"Patient capital", "Growth equity"}:
+                lendable = (fund.cash - 12.0) * 0.35
+                self.credit_market.register_offer(
+                    CreditOffer(
+                        lender_id=fund.id,
+                        amount=lendable,
+                        minimum_annual_rate=self.credit_market.reference_rate_annual + 0.065,
+                        accepted_seniorities=("secured", "senior"),
+                    )
+                )
+            if (
+                fund.strategy in {"Momentum", "Leveraged extraction"}
+                and leverage < fund.target_leverage
+                and fund.cash < 18.0
+            ):
+                amount = min(16.0, 5.0 + 7.0 * (fund.target_leverage - leverage))
+                self.credit_market.register_application(
+                    CreditApplication(
+                        borrower_id=fund.id,
+                        amount=amount,
+                        maximum_annual_rate=0.22,
+                        term_periods=8,
+                        amortization="interest_only",
+                        purpose="fund leverage",
+                        seniority="senior",
+                        collateral_type="equity portfolio",
+                        collateral_value=0.55 * fund.equity_value(self.equity_market),
+                        covenant_max_leverage=fund.target_leverage * 1.35,
+                    )
+                )
+
+    def _select_candidate_firms(self) -> List[Firm]:
+        return [
+            firm
+            for firm in self.firms
+            if firm.alive and firm.status not in {"delinquent", "liquidated"}
+        ]
+
+    def _fund_equity_actions(self) -> None:
+        candidates = self._select_candidate_firms()
+        if not candidates:
+            return
+        for fund in [f for f in self.funds if f.alive]:
+            fund.last_action = "hold"
+            # First manage existing holdings.
+            for firm_id, position in list(fund.equity_positions.items()):
+                firm = self.equity_market.firms.get(firm_id)
+                if firm is None or not firm.alive:
+                    continue
+                holding_period = self.turn - position.entry_turn
+                momentum = self.equity_market.momentum(firm_id)
+                ownership = self.equity_market.ownership_fraction(fund, firm)
+                distress = firm.status in {"delinquent", "reorganized"} or firm.rolling_profit() < -0.8
+                if fund.strategy == "Patient capital" and holding_period > 26 and momentum < -0.08:
+                    self.equity_market.secondary_sell(fund, firm, position.shares * 0.25)
+                    fund.last_action = "patient trim"
+                elif fund.strategy == "Growth equity" and holding_period > 14 and firm.rolling_growth() < -0.04:
+                    self.equity_market.secondary_sell(fund, firm, position.shares * 0.45)
+                    fund.last_action = "growth exit"
+                elif fund.strategy == "Momentum" and (momentum < -0.025 or holding_period > 5):
+                    self.equity_market.secondary_sell(fund, firm, position.shares * 0.75)
+                    fund.last_action = "momentum exit"
+                elif fund.strategy == "Leveraged extraction":
+                    if (
+                        ownership >= 0.12
+                        and firm.rolling_profit() > 0.15
+                        and holding_period >= 4
+                        and self.turn - firm.last_recap_turn > 12
+                        and firm.pending_dividend_recap_sponsor is None
+                    ):
+                        debt_capacity = max(0.0, 2.7 * max(firm.rolling_profit(), 0.0) + 0.12 * firm.productive_capital)
+                        amount = min(18.0, max(3.0, debt_capacity))
+                        firm.pending_dividend_recap_sponsor = fund.id
+                        self.credit_market.register_application(
+                            CreditApplication(
+                                borrower_id=firm.id,
+                                amount=amount,
+                                maximum_annual_rate=0.29,
+                                term_periods=12,
+                                amortization="interest_only",
+                                purpose="dividend recap",
+                                seniority="senior",
+                                collateral_type="enterprise assets",
+                                collateral_value=0.45 * firm.productive_capital,
+                                covenant_max_leverage=3.2,
+                                sponsor_id=fund.id,
+                            )
+                        )
+                        fund.recap_targets[firm.id] = self.turn
+                        fund.last_action = "recap requested"
+                    if holding_period > 9 and (momentum > 0.03 or distress):
+                        reason = "fire_sale" if distress else "voluntary"
+                        self.equity_market.secondary_sell(fund, firm, position.shares * 0.82, reason=reason)
+                        fund.last_action = "leveraged exit"
+
+            investable = max(0.0, fund.cash - 5.0)
+            if investable < 1.0:
+                continue
+
+            if fund.strategy == "Patient capital":
+                target = max(
+                    candidates,
+                    key=lambda firm: (
+                        1.5 * firm.rolling_profit()
+                        + 0.04 * firm.productive_capital
+                        - 0.3 * firm.debt_outstanding(self.credit_market)
+                    ),
+                )
+                amount = min(investable * 0.22, 8.0)
+                self.equity_market.primary_invest(
