@@ -1,0 +1,20 @@
+__pycache__/
+*.py[cod]
+*.so
+.Python
+.venv/
+venv/
+env/
+ENV/
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+.DS_Store
+Thumbs.db
+
+# Generated simulation outputs
+*.gif
+metrics.csv
+final_economy.png
+snapshot*.png
