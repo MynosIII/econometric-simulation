@@ -1,0 +1,169 @@
+                    fund, target, amount, self.turn, governance_boost=0.025
+                )
+                fund.last_action = "patient investment"
+            elif fund.strategy == "Growth equity":
+                target = max(
+                    candidates,
+                    key=lambda firm: 2.2 * firm.rolling_growth() + 0.08 * firm.productivity - 0.02 * firm.age,
+                )
+                amount = min(investable * 0.30, 9.5)
+                self.equity_market.primary_invest(
+                    fund, target, amount, self.turn, governance_boost=0.018
+                )
+                fund.last_action = "growth investment"
+            elif fund.strategy == "Momentum":
+                target = max(candidates, key=lambda firm: self.equity_market.momentum(firm.id))
+                if self.equity_market.momentum(target.id) > -0.01:
+                    amount = min(investable * 0.36, 7.0)
+                    self.equity_market.primary_invest(fund, target, amount, self.turn)
+                    target.market_sentiment = min(1.55, target.market_sentiment + 0.035)
+                    fund.last_action = "momentum buy"
+            else:  # Leveraged extraction
+                eligible = [
+                    firm
+                    for firm in candidates
+                    if firm.rolling_profit() > 0.0
+                    and firm.debt_outstanding(self.credit_market)
+                    < 1.2 * max(firm.net_worth(self.credit_market, self.equity_market), 1.0)
+                ]
+                if eligible:
+                    target = max(
+                        eligible,
+                        key=lambda firm: firm.rolling_profit() + 0.03 * firm.productive_capital,
+                    )
+                    amount = min(investable * 0.42, 10.0)
+                    self.equity_market.primary_invest(fund, target, amount, self.turn)
+                    target.market_sentiment = min(1.60, target.market_sentiment + 0.06)
+                    fund.last_action = "control stake"
+
+    def _corporate_cross_investment(self) -> None:
+        rich_firms = [
+            firm
+            for firm in self.firms
+            if firm.alive and firm.cash > 28.0 and firm.rolling_profit() > 0.4
+        ]
+        targets = [firm for firm in self.firms if firm.alive]
+        for investor in rich_firms[:8]:
+            possible = [firm for firm in targets if firm.id != investor.id]
+            if not possible:
+                continue
+            target = max(
+                possible,
+                key=lambda firm: firm.rolling_growth() + 0.04 * firm.productivity,
+            )
+            amount = min(2.5, 0.06 * investor.cash)
+            self.equity_market.primary_invest(
+                investor, target, amount, self.turn, governance_boost=0.004
+            )
+
+    def _process_originated_special_transactions(self, originated: List[LoanContract]) -> None:
+        agents = self.agents_by_id
+        recap_borrowers = {loan.borrower_id for loan in originated if loan.purpose == "dividend recap"}
+        for loan in originated:
+            if loan.purpose != "dividend recap":
+                continue
+            firm = agents.get(loan.borrower_id)
+            if not isinstance(firm, Firm) or not firm.alive:
+                continue
+            payout = 0.78 * loan.original_principal
+            paid = self.equity_market.distribute_dividend(
+                firm, agents, payout, recap=True
+            )
+            firm.last_recap_turn = self.turn
+            firm.pending_dividend_recap_sponsor = None
+            if paid > 0:
+                firm.market_sentiment = min(1.65, firm.market_sentiment + 0.09)
+        for firm in self.firms:
+            if firm.pending_dividend_recap_sponsor is not None and firm.id not in recap_borrowers:
+                firm.pending_dividend_recap_sponsor = None
+
+    def _regular_dividends(self) -> None:
+        agents = self.agents_by_id
+        for firm in [f for f in self.firms if f.alive]:
+            profit = max(firm.operating_profit_last_turn, 0.0)
+            if profit <= 0 or firm.cash < 2.5:
+                continue
+            amount = min(
+                firm.cash - 2.0,
+                profit * firm.traits.dividend_rate,
+            )
+            self.equity_market.distribute_dividend(firm, agents, amount, recap=False)
+
+    def _resolve_distress(self, distressed_ids: List[str]) -> None:
+        agents = self.agents_by_id
+        candidates = set(distressed_ids)
+        for agent in agents.values():
+            if agent.alive and self.insolvency.should_resolve(
+                agent, self.credit_market, self.equity_market
+            ):
+                candidates.add(agent.id)
+        for agent_id in list(candidates):
+            agent = agents.get(agent_id)
+            if agent is None or not agent.alive:
+                continue
+            result = self.insolvency.resolve(
+                agent,
+                agents,
+                self.credit_market,
+                self.equity_market,
+                self.turn,
+            )
+            self.last_resolution_events.append((agent_id, result))
+
+    def _resolve_banks(self) -> None:
+        agents = self.agents_by_id
+        for bank in self.banks:
+            if not bank.alive or bank.failed:
+                continue
+            net_worth = bank.net_worth(self.credit_market, self.equity_market)
+            capital_ratio = bank.capital_ratio(self.credit_market, self.equity_market)
+            run_failure = bank.unmet_withdrawals_last_turn > 1e-7
+            if net_worth >= 0 and capital_ratio >= -0.02 and not run_failure:
+                continue
+
+            # Private fire-sale auction of the failed bank's loan book.
+            bidders = [
+                agent
+                for agent in self.agents
+                if agent.alive
+                and agent.id != bank.id
+                and isinstance(agent, (Bank, InvestmentFund, Firm))
+                and agent.cash > 1.0
+            ]
+            for loan_id in list(bank.loans_lent):
+                loan = self.credit_market.loans.get(loan_id)
+                if loan is None or loan.status not in {"active", "delinquent", "restructured"}:
+                    continue
+                quality = 0.88
+                if loan.status == "restructured":
+                    quality = 0.62
+                if loan.status == "delinquent" or loan.missed_payments >= 2:
+                    quality = 0.38
+                expected_price = loan.outstanding * quality
+                affordable = [bidder for bidder in bidders if bidder.cash > 0.25]
+                if not affordable:
+                    continue
+                buyer = max(affordable, key=lambda bidder: bidder.cash)
+                fire_sale_price = min(expected_price, max(0.0, buyer.cash - 0.25))
+                if fire_sale_price <= 0.0:
+                    continue
+                buyer.cash -= fire_sale_price
+                bank.cash += fire_sale_price
+                loan.lender_id = buyer.id
+                if loan_id not in buyer.loans_lent:
+                    buyer.loans_lent.append(loan_id)
+                if loan_id in bank.loans_lent:
+                    bank.loans_lent.remove(loan_id)
+
+            self.equity_market.liquidate_portfolio(bank, float("inf"))
+            depositor_recovery = min(bank.deposits, max(bank.cash, 0.0))
+            self.deposit_losses_last_turn += max(0.0, bank.deposits - depositor_recovery)
+            bank.deposits = 0.0
+            bank.cash = 0.0
+            bank.alive = False
+            bank.failed = True
+            bank.status = "private_liquidation"
+            bank.failure_turn = self.turn
+            self.bank_failures_last_turn += 1
+
+    def _household_survival_and_entry(self) -> None:
