@@ -1,0 +1,208 @@
+        rate_gap = max(0.0, market_reference_rate - self.deposit_rate_annual)
+        stress = (
+            1.9 * max(0.0, self.minimum_operating_capital_ratio - capital_ratio)
+            + 1.4 * max(0.0, self.liquidity_preference - liquidity_ratio)
+            + 0.75 * own_npl
+            + 0.25 * rate_gap
+        )
+        target_confidence = float(np.clip(1.0 - stress, 0.0, 1.0))
+        self.deposit_confidence = float(
+            np.clip(0.72 * self.deposit_confidence + 0.28 * target_confidence, 0.0, 1.0)
+        )
+        withdrawal_fraction = float(
+            np.clip(
+                0.52 * max(0.0, 0.72 - self.deposit_confidence)
+                + 0.18 * max(0.0, self.liquidity_preference - liquidity_ratio),
+                0.0,
+                0.48,
+            )
+        )
+        requested = self.deposits * withdrawal_fraction
+        paid = min(max(self.cash, 0.0), requested)
+        self.cash -= paid
+        self.deposits -= paid
+        unmet = max(0.0, requested - paid)
+        self.run_withdrawals_last_turn = paid
+        self.unmet_withdrawals_last_turn = unmet
+        if unmet > 1e-7:
+            self.status = "run_insolvent"
+        elif withdrawal_fraction > 0.05:
+            self.status = "deposit_run"
+        return float(paid), float(unmet)
+
+
+FUND_STRATEGIES = (
+    "Patient capital",
+    "Growth equity",
+    "Momentum",
+    "Leveraged extraction",
+)
+
+FUND_COLORS = {
+    "Patient capital": "teal",
+    "Growth equity": "goldenrod",
+    "Momentum": "purple",
+    "Leveraged extraction": "crimson",
+}
+
+
+class InvestmentFund(BaseAgent):
+    def __init__(
+        self,
+        agent_id: str,
+        strategy: str,
+        rng: np.random.Generator,
+        map_position: Tuple[float, float],
+    ):
+        super().__init__(agent_id, cash=float(rng.uniform(35.0, 62.0)))
+        self.strategy = strategy
+        self.risk_tolerance = float(rng.uniform(0.45, 0.95))
+        self.target_leverage = {
+            "Patient capital": 0.20,
+            "Growth equity": 0.45,
+            "Momentum": 0.85,
+            "Leveraged extraction": 1.55,
+        }[strategy]
+        self.map_position = np.array(map_position, dtype=float)
+        self.realized_profit = 0.0
+        self.recap_targets: Dict[str, int] = {}
+        self.last_action = "none"
+
+    def credit_features(
+        self,
+        credit_market: "CreditMarket",
+        equity_market: "EquityMarket",
+    ) -> Dict[str, float]:
+        equity = max(self.net_worth(credit_market, equity_market), 0.5)
+        debt = self.debt_outstanding(credit_market)
+        return {
+            "leverage": debt / equity,
+            "profitability": self.realized_profit / max(equity, 1.0),
+            "liquidity": self.cash / max(debt + 1.0, 1.0),
+            "stability": self.credit_score - 0.12 * self.risk_tolerance,
+        }
+
+
+# ============================================================
+# EQUITY MARKET
+# ============================================================
+
+
+class EquityMarket:
+    def __init__(self, config: SimulationConfig, rng: np.random.Generator):
+        self.config = config
+        self.rng = rng
+        self.firms: Dict[str, Firm] = {}
+        self.prices: Dict[str, float] = {}
+        self.previous_prices: Dict[str, float] = {}
+        self.order_flow: Dict[str, float] = defaultdict(float)
+        self.realized_transactions = 0
+        self.dividends_paid_last_turn = 0.0
+        self.recap_dividends_last_turn = 0.0
+        self.total_primary_investment_last_turn = 0.0
+
+    def register_firm(self, firm: Firm) -> None:
+        self.firms[firm.id] = firm
+        initial = max(0.12, (firm.cash + 0.75 * firm.productive_capital) / firm.shares_outstanding)
+        self.prices[firm.id] = initial
+        self.previous_prices[firm.id] = initial
+
+    def price_of(self, firm_id: str) -> float:
+        return float(self.prices.get(firm_id, 0.0))
+
+    def momentum(self, firm_id: str) -> float:
+        current = self.price_of(firm_id)
+        previous = self.previous_prices.get(firm_id, current)
+        return current / max(previous, 1e-9) - 1.0
+
+    def ownership_fraction(self, investor: BaseAgent, firm: Firm) -> float:
+        position = investor.equity_positions.get(firm.id)
+        return 0.0 if position is None else float(position.shares / max(firm.shares_outstanding, 1e-9))
+
+    def primary_invest(
+        self,
+        investor: BaseAgent,
+        firm: Firm,
+        amount: float,
+        turn: int,
+        governance_boost: float = 0.0,
+    ) -> float:
+        if not investor.alive or not firm.alive:
+            return 0.0
+        amount = min(max(amount, 0.0), max(investor.cash - 1.0, 0.0))
+        if amount < 0.25:
+            return 0.0
+        price = max(self.price_of(firm.id), 0.05)
+        new_shares = amount / price
+        investor.cash -= amount
+        firm.cash += amount
+        firm.shares_outstanding += new_shares
+        position = investor.equity_positions.get(firm.id)
+        if position is None:
+            investor.equity_positions[firm.id] = EquityPosition(new_shares, amount, turn)
+        else:
+            position.shares += new_shares
+            position.cost_basis += amount
+        firm.governance_boost = min(0.35, firm.governance_boost + governance_boost)
+        self.order_flow[firm.id] += new_shares
+        self.total_primary_investment_last_turn += amount
+        return float(new_shares)
+
+    def secondary_sell(
+        self,
+        investor: BaseAgent,
+        firm: Firm,
+        shares: float,
+        reason: str = "voluntary",
+    ) -> float:
+        position = investor.equity_positions.get(firm.id)
+        if position is None or position.shares <= 0:
+            return 0.0
+        quantity = min(max(shares, 0.0), position.shares)
+        if quantity <= 0:
+            return 0.0
+        participation = quantity / max(firm.shares_outstanding, 1.0)
+        impact = self.config.equity_price_impact * quantity / max(self.config.equity_market_depth, 1.0)
+        distress_multiplier = 2.2 if reason in {"margin", "bankruptcy", "fire_sale"} else 1.0
+        execution_price = self.price_of(firm.id) * max(0.10, 1.0 - impact * distress_multiplier)
+        proceeds = quantity * execution_price
+        allocated_cost = position.cost_basis * (quantity / max(position.shares, 1e-9))
+        position.shares -= quantity
+        position.cost_basis -= allocated_cost
+        investor.cash += proceeds
+        if isinstance(investor, InvestmentFund):
+            investor.realized_profit += proceeds - allocated_cost
+        if position.shares <= 1e-8:
+            del investor.equity_positions[firm.id]
+        self.order_flow[firm.id] -= quantity * distress_multiplier
+        self.realized_transactions += 1
+        return float(proceeds)
+
+    def liquidate_portfolio(self, investor: BaseAgent, cash_needed: float) -> float:
+        raised = 0.0
+        holdings = sorted(
+            list(investor.equity_positions.items()),
+            key=lambda item: item[1].shares * self.price_of(item[0]),
+            reverse=True,
+        )
+        for firm_id, position in holdings:
+            firm = self.firms.get(firm_id)
+            if firm is None or not firm.alive:
+                continue
+            needed = max(0.0, cash_needed - raised)
+            shares = min(position.shares, needed / max(self.price_of(firm_id), 1e-9))
+            raised += self.secondary_sell(investor, firm, shares, reason="margin")
+            if raised >= cash_needed - 1e-9:
+                break
+        return float(raised)
+
+    def distribute_dividend(
+        self,
+        firm: Firm,
+        agents_by_id: Dict[str, BaseAgent],
+        amount: float,
+        recap: bool = False,
+    ) -> float:
+        amount = min(max(amount, 0.0), max(firm.cash, 0.0))
+        if amount <= 0:
+            return 0.0
